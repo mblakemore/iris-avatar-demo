@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Iris — OpenAvatar demo</title>
+<meta name="description" content="A talking head-and-shoulders avatar rendered live in your browser. Drag to turn her head; press play to hear her speak.">
+<style>
+  :root { color-scheme: dark; --bg: #14151a; --fg: #ececf2; --mut: #9a9cab; --line: rgba(236,236,242,.22); --acc: #8fb0ff; --bar: rgba(26,27,34,.82); }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  header { position: fixed; left: 0; right: 0; top: 0; padding: calc(14px + env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) 0 max(16px, env(safe-area-inset-left, 0px)); pointer-events: none; }
+  h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .01em; }
+  header p { margin: 2px 0 0; color: var(--mut); font-size: 13px; }
+  #bar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(18px + env(safe-area-inset-bottom, 0px)); display: flex; gap: 8px; align-items: center; padding: 8px; background: var(--bar); border: 1px solid var(--line); border-radius: 999px; backdrop-filter: blur(8px); max-width: calc(100vw - 32px); }
+  button { font: inherit; color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 9px 18px; cursor: pointer; white-space: nowrap; }
+  button:hover, button:focus-visible { border-color: var(--acc); outline: none; }
+  #play { background: var(--acc); border-color: var(--acc); color: #10131c; font-weight: 600; }
+  #msg { position: fixed; inset: 0; display: grid; place-items: center; color: var(--mut); pointer-events: none; text-align: center; padding: 0 24px; }
+  @media (max-width: 560px) { #info { display: none; } }
+  #info { position: fixed; right: max(16px, env(safe-area-inset-right, 0px)); top: calc(16px + env(safe-area-inset-top, 0px)); color: var(--mut); font-size: 12px; pointer-events: none; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="Iris, a 3D avatar. Drag to turn her head."></canvas>
+<header><h1>Iris</h1><p>Drag to turn her head · scroll or pinch to zoom</p></header>
+<div id="info"></div>
+<div id="msg">Loading…</div>
+<div id="bar" hidden><button id="play">Hear her speak</button><button id="reset">Reset view</button></div>
+<audio id="aud" src="sample.mp3" preload="auto"></audio>
+<script type="module">
+import { OpenAvatarViewer } from "./openavatar-viewer.js";
+const $ = id => document.getElementById(id);
+try {
+  const v = await OpenAvatarViewer.create($("c"), {
+    modelUrl: "iris.bin", pointer: true, background: "#14151a",
+    on: { progress: f => { $("msg").textContent = "Loading " + Math.round(f * 100) + "%"; },
+          frame: s => { $("info").textContent = `${s.n.toLocaleString()} Gaussians · ${s.fps.toFixed(0)} fps`; } }
+  });
+  $("msg").hidden = true; $("bar").hidden = false;
+  const a = $("aud");
+  v.attachAudio(a, { driver: "loudness" });
+  const label = () => { $("play").textContent = a.paused ? "Hear her speak" : "Stop"; };
+  const toggle = () => { if (a.paused) { a.currentTime = 0; a.play(); } else { a.pause(); } };
+  a.addEventListener("play", label); a.addEventListener("pause", label); a.addEventListener("ended", label);
+  $("play").onclick = toggle;
+  $("reset").onclick = () => v.setPose({ yaw: 0, pitch: 0, zoom: 1 });
+  // a click on her (a press that did not turn into a drag) also plays the line
+  let down = null;
+  $("c").addEventListener("pointerdown", e => { down = { x: e.clientX, y: e.clientY, t: performance.now() }; });
+  $("c").addEventListener("pointerup", e => {
+    if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6 && performance.now() - down.t < 400) toggle();
+    down = null;
+  });
+  addEventListener("keydown", e => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); toggle(); } });
+} catch (e) { $("msg").textContent = "Could not start: " + e.message; }
+</script>
+</body>
+</html>
