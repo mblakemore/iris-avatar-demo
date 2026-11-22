@@ -61,6 +61,8 @@ export const DEFAULT_PRESET = {
     maxPerControl: {},                     // e.g. {"ah": 0.7}; missing = 1
     clampToTrained: true,                  // keep speech weights inside the range seen in training (prototype behaviour)
     dipBridge: 0.035,                      // loudness driver: seconds; a dip of the level shorter than this (a short stop inside a vowel: "I", "avatar") is bridged before the narrow window, so the mouth does not snap shut for one frame. Pauses and the lip closures (driver.lips) are not affected. 0 = off (spikes/snaps)
+    openGain: 1,                           // both drivers, OPT-IN (spikes/mouthgain): the five opening shapes x this, on top of articulation, AND the opening-sum limit raised to match (1 = as before). A number, or per control {wide, ah, ee, oo, mid} (missing = 1). Closures are not affected. On v20 1.2 opens wide vowels ~15 % further and the interior smear grows with it; 1.35 and up add dark specks at the corners
+    openSum: 0,                            // the opening-sum limit with openGain; 0 = auto (max(1, the largest gain)); never below 1
     articulation: 1.1,                     // both drivers: how far the mouth opens on vowels (opening shapes x this; above a sum of 1 the jaw takes the room). 1.1 = default, 0.8 about the earlier look, 1.3 emphatic. Closures are not affected
     timed: { attack: 0.05, release: 0.10, timeOffset: 0, minVisible: 0.07, tongueMin: 0.05,   // attack / release scale the events' own ramps (0.05 / 0.10 = as designed); seconds
              stressOpen: 1.06, unstressedOpen: 0.75 },  // (stressOpen 1.12 until lipsync4) vowels with a known lexical stress (pronouncing dictionary, or ARPAbet phones with stress digits): primary stress opens this much more, unstressed this much less
@@ -483,15 +485,24 @@ function makeRelease(n, eps, T = SPEECH_RELEASE_S, out = 2) {           // out: 
 // Articulation: the opening shapes are scaled by k; when that takes the five shapes above a sum of 1 (where the rig's shapes start to tear), the shapes other
 // than the jaw ("wide") give way first, so a bigger k means more jaw, never a broken mouth. k = 1 leaves the blend as it is. `press` is not touched.
 const OPEN_CTL = ["wide", "ah", "ee", "oo", "mid"];
-function articulationIndex(env) { return { wide: env.index("wide"), rest: OPEN_CTL.slice(1).map(n => env.index(n)).filter(i => i >= 0) }; }
-function articulate(out, k, ix, floorWide = 0) {
+function articulationIndex(env) { return { wide: env.index("wide"), rest: OPEN_CTL.slice(1).map(n => env.index(n)).filter(i => i >= 0), restN: OPEN_CTL.slice(1).filter(n => env.index(n) >= 0) }; }
+// OPEN GAIN (spikes/mouthgain): driver.openGain multiplies the opening shapes further (per control when an object) and lifts the sum limit from 1 to
+// driver.openSum (0 = the largest gain): the trained opening shapes undershoot the stills (v20 at weight 1: ah 0.60, wide 0.72 of their chin drop), so a
+// little more than one whole shape in total still reads as a mouth. `ramp` (0..1) fades it in like articulation (loudness: real openings only; timed: 1 - shut).
+function openGainOf(S, ix) {
+  const G = S.openGain ?? 1, per = n => { const v = isObj(G) ? G[n] : G; return Number.isFinite(+v) && +v > 0 ? +v : 1; };
+  const gw = per("wide"), gr = OPEN_CTL.slice(1).map(per), top = Math.max(gw, ...gr), sum = Math.max(1, +S.openSum > 0 ? +S.openSum : top);
+  return gw === 1 && sum === 1 && gr.every(x => x === 1) ? null : { gw, gr: OPEN_CTL.slice(1).map((n, j) => ix.restN.includes(n) ? gr[j] : null).filter(x => x !== null), sum };
+}
+function articulate(out, k, ix, floorWide = 0, og = null, ramp = 1) {
   if (!(k >= 0)) k = 1;
-  const w = ix.wide; let sumO = 0;
+  const w = ix.wide; let sumO = 0, cap = 1;
   if (k !== 1) { if (w >= 0) out[w] *= k; for (const i of ix.rest) out[i] *= k; }
+  if (og && ramp > 0) { const f = g => 1 + (g - 1) * ramp; if (w >= 0) { out[w] *= f(og.gw); floorWide *= f(og.gw); } ix.rest.forEach((i, j) => { out[i] = Math.min(out[i] * f(og.gr[j]), 1); }); cap = f(og.sum); }   // no single shape past its trained weight
   if (w >= 0 && floorWide > out[w]) out[w] = floorWide;              // a stressed open vowel: the jaw drops at least this far
   if (w >= 0) out[w] = Math.min(out[w], 1);
   for (const i of ix.rest) sumO += out[i];
-  const room = 1 - (w >= 0 ? out[w] : 0);
+  const room = cap - (w >= 0 ? out[w] : 0);
   if (sumO > room && sumO > 0) { const f = Math.max(0, room) / sumO; for (const i of ix.rest) out[i] *= f; }
 }
 // LIP CLOSURES FROM THE SOUND (loudness driver, spikes/loudlips). The opening follows the level, so the lips used to shut only where the level dips: not
@@ -705,7 +716,7 @@ function loudnessDriver(env) {
         const amp = (S.gain ?? 1) * Math.pow(o, S.expand ?? 0.7) / acc[0];
         for (let c = 0; c < NC; c++) { const share = acc[c + 1] * amp; if (share > 0) for (const [i, v] of shapes[c]) out[i] += share * v; }
         for (let i = 0; i < out.length; i++) out[i] = clamp(out[i], 0, 1);
-        const art = S.articulation ?? 1; articulate(out, 1 + (art - 1) * ss((o - 0.35) / 0.4), aix);   // only real openings grow: narrowed closures (m, stop gaps) stay as narrow as without it
+        const art = S.articulation ?? 1, ra = ss((o - 0.35) / 0.4); articulate(out, 1 + (art - 1) * ra, aix, 0, openGainOf(S, aix), ra);   // only real openings grow: narrowed closures (m, stop gaps) stay as narrow as without it
       }
       const want = lipsOn ? lips.at(Math.min(clock + (L.lead ?? 0), td), L) : 0;   // the sound's own lip closures (m hum, p / b stop), on the heard time (not run ahead by lead)
       const up = 1.5 * dt / (L.attack ?? 0.035), down = 1.5 * dt / (L.release ?? 0.03);   // never faster than the ramps: a closure decided late (no lookahead) still eases in
@@ -1049,7 +1060,7 @@ function timedDriver(env) {
       }
       const k = sum > 1e-9 ? top * (1 - shut) / sum : 0, pi = env.index("press");   // p/b/m: the blend of everything else is faded out and the lips press together
       for (let i = 0; i < out.length; i++) out[i] = clamp(acc[i] * k, 0, 1);
-      const art = S.articulation ?? 1; articulate(out, art, aix, floor * art * (1 - shut));
+      const art = S.articulation ?? 1; articulate(out, art, aix, floor * art * (1 - shut), openGainOf(S, aix), 1 - shut);
       if (pi >= 0 && shut > 0) out[pi] = Math.max(out[pi], shut * (VISEME_WEIGHTS.pbm.press ?? 1));
       top = Math.max(top, shut); speaking = top > 0.05; level = top;
       let nb = 1; for (const b of beats) { const u = tv - b.t; if (u <= -BEAT_PRE) break; nb *= 1 - b.a * beatPulse(u); } beat = 1 - nb;   // overlapping nods add smoothly (a max had a kink where one overtook the other)
