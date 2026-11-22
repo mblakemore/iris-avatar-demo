@@ -41,7 +41,12 @@ try {
   });
   $("msg").hidden = true; $("bar").hidden = false;
   const a = $("aud");
-  v.attachAudio(a, { driver: "loudness" });
+  // timed lip sync from the speech service's character timings; falls back to loudness if they are missing
+  let timings = null;
+  try { timings = (await (await fetch("sample.json")).json()).timings; } catch {}
+  await OpenAvatarViewer.loadLexicon();
+  if (timings) { v.attachAudio(a, { driver: "timed" }); v.setDriver("timed", { timings }); v.setTrack({ timings }); }
+  else v.attachAudio(a, { driver: "loudness" });
   const label = () => { $("play").textContent = a.paused ? "Hear her speak" : "Stop"; };
   const toggle = () => { if (a.paused) { a.currentTime = 0; a.play(); } else { a.pause(); } };
   a.addEventListener("play", label); a.addEventListener("pause", label); a.addEventListener("ended", label);
