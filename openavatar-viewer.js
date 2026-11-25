@@ -18,7 +18,7 @@
  * whose major version is higher than FORMAT_MAJOR is refused (error code "version").
  */
 
-export const FORMAT_MAJOR = 1;
+export const FORMAT_MAJOR = 2;                                   // 2 = the compact format (spikes/lf_finish/FORMAT.md B); format-1 files read as before
 
 // ------------------------------------------------------------------ small helpers
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
@@ -102,6 +102,70 @@ export const DEFAULT_PRESET = {
             beat: { enabled: true, nodDeg: 0.9, settleDeg: 0.6 } }   // head co-motion from the speech: a small nod on phrase starts and stressed vowels, a slight settle at phrase ends (needs idle motion on)
 };
 
+// ------------------------------------------------------------------ render options (spikes/lf_render; ROADMAP 3.4). ALL OFF BY DEFAULT: with these values a frame
+// is drawn exactly as before (same shaders' arithmetic, clear + splats). create(canvas, { render: {...} }), v.setRender({...}) or setPreset({ render: {...} }) turn them on.
+export const RENDER_DEFAULTS = {
+  supersample: 1,          // desktop AA: the canvas gets supersample x the device pixel ratio (the browser scales it down); 1 = off, 1.5 suggested on desktop GPUs
+  maxDpr: 3,               // cap on device pixel ratio x supersample
+  aaCompensation: "auto",  // gsplat "antialiased" mode: opacity x sqrt(det(S) / det(S + 0.3 I)). "auto" = only when the model header says antialiased: true (TRAIN 3.3.5); true / false force
+  sort: "z",               // depth order key: "z" (view depth, as before) | "radial" (distance to the camera)
+  sortEvery: 1,            // GPU renderer, loop frames: sort at most every Nth frame and draw the others at once with the last order (phones: 2); 1 = every frame
+  sortEveryExact: false,   // tests: apply sortEvery to renderOnce frames too
+  shClampDeg: 0,           // SH colour seen from at most +-this head yaw (the stills' arc, 35): beyond it each Gaussian keeps the colour it has at the arc's end. 0 = off
+  shDegree: 2,             // view-dependent colour terms: 2 = all (as trained), 1 = phones (skip the 5 degree-2 terms), 0 = base colour only
+  quadExtent: 4,           // CREATE-TIME: splat cut-off, |q|^2 in the shader (4 = as before; 3 = smaller quads, less fill: mobile)
+  splatScale: 1,           // splats drawn into a target this fraction of the canvas and scaled up (0.5 = half resolution: mobile fill rate); 1 = off
+  catchlights: null,       // eye glints: true / {} = on with CATCHLIGHT_DEFAULTS, or an object overriding them
+  relight: null,           // reserved (ROADMAP 4.5: not adopted, see spikes/lf_render/LOG.md)
+  post: null               // portrait finish: "portrait" (= PORTRAIT_POST) or an object { vignette, grain, plate, shadow }
+};
+export const CATCHLIGHT_DEFAULTS = {
+  radius: 0.008,           // m: the glint sits on a sphere this big (the cornea's curvature, 7.8 mm; 0.012 = the eyeball: glints run off the iris at +-35) at centre + radius * normalize(to camera + to light)
+  eyes: null,              // [[x, y, z], [x, y, z]] sphere centres (model metres) or null = from the header's blinkSweep.eyes + the cornea surface in front of them
+  // lights, camera-relative: az (deg, + = viewer's right), el (deg, + = up), size (m, sigma on the cornea), intensity (added light, 0..1), color
+  lights: [{ az: -12, el: 14, size: 0.0006, intensity: 0.55, color: [1, 0.98, 0.95] },
+           { az: 16, el: -6, size: 0.00035, intensity: 0.16, color: [0.93, 0.96, 1] }],
+  minPx: 0.6,              // smallest glint sigma in canvas pixels
+  halo: 0.22,              // a faint wide halo (x 3 the size) around each glint: reads as wet rather than a dot
+  fadeDeg: [38, 50]        // the glint fades out between these angles from the eye's forward axis (it leaves the cornea; turned away from the light it goes)
+};
+export const PORTRAIT_POST = {
+  vignette: 0.28,          // darkening in the corners (0..1)
+  grain: 0.03,             // fine animated grain amplitude (relative)
+  plate: { lift: 0.10, falloff: 0.9, tint: [1.0, 0.97, 0.93], centre: [0.5, 0.38] },   // soft lighter area behind the head instead of a flat colour (lift = brightness added on dark, darkening on light backgrounds)
+  shadow: { amount: 0.35, width: 1.25, height: 0.22 }                                // soft contact shadow behind the torso fade (sizes x the bust's width)
+};
+export const RENDER_PROFILES = {                                // starting points for a page; nothing applies them by itself
+  desktop: { supersample: 1.5 },
+  phone: { sortEvery: 2, shDegree: 1, quadExtent: 3, splatScale: 0.5 },
+  portrait: { catchlights: true, post: "portrait" }
+};
+const NO_XO = { shc: null, deg: 2, radial: false };
+function readRender(base, add) {                                 // merge, then expand the shorthands (true / "portrait")
+  const a = add ? { ...add } : {};
+  if (a.catchlights === true) a.catchlights = {}; if (a.post === "portrait") a.post = PORTRAIT_POST; if (a.post === true) a.post = PORTRAIT_POST;
+  const r = mergeDeep(base, a);
+  if (r.catchlights) r.catchlights = mergeDeep(CATCHLIGHT_DEFAULTS, r.catchlights);
+  if (r.post) r.post = mergeDeep({ vignette: 0, grain: 0, plate: null, shadow: null }, r.post);
+  return r;
+}
+// The pupils (catchlights): per blinkSweep eye, the opacity-weighted centre of the dark (base colour luminance < 0.18), opaque Gaussians within 8 mm that move
+// with gazeX; null for an eye with too few. A few ms over the model once at load (front models with a blink sweep only).
+function findPupils(D, BS, alpha0, gk, Km) {
+  if (gk < 0 || !D.dc || !D.mot) return null; const m = D.mean, mo = D.mot, dc = D.dc, n = D.n;
+  return BS.eyes.map(([cx0, top, bot]) => { const cy0 = 0.5 * (top + bot); let sx = 0, sy = 0, sw = 0;
+    for (let i = 0; i < n; i++) { const x = m[i * 3], y = m[i * 3 + 1]; if (Math.abs(x - cx0) > 0.008 || Math.abs(y - cy0) > 0.008 || alpha0[i] < 0.3) continue;
+      const o = (i * Km + gk) * 3; if (Math.hypot(mo[o], mo[o + 1], mo[o + 2]) < 0.0005) continue;
+      const l = 0.299 * (C0 * dc[i * 3] + 0.5) + 0.587 * (C0 * dc[i * 3 + 1] + 0.5) + 0.114 * (C0 * dc[i * 3 + 2] + 0.5); if (l >= 0.18) continue;
+      sx += alpha0[i] * x; sy += alpha0[i] * y; sw += alpha0[i]; }
+    return sw > 3 ? [sx / sw, sy / sw] : null; });
+}
+// Where a catchlight sits (pure, tested): eye sphere centre c, camera position cam, unit direction to the light l (all world), radius r -> c + r * normalize(normalize(cam - c) + l)
+function catchlightPoint(c, cam, l, r) {
+  let vx = cam[0] - c[0], vy = cam[1] - c[1], vz = cam[2] - c[2]; const iv = 1 / (Math.hypot(vx, vy, vz) || 1); vx = vx * iv + l[0]; vy = vy * iv + l[1]; vz = vz * iv + l[2];
+  const ih = 1 / (Math.hypot(vx, vy, vz) || 1); return [c[0] + r * vx * ih, c[1] + r * vy * ih, c[2] + r * vz * ih, vx * ih, vy * ih, vz * ih];   // point, then the unit half vector
+}
+
 // ------------------------------------------------------------------ model file
 let H2F = null;
 function halfTable() {
@@ -121,6 +185,7 @@ function parseModel(buf) {
   if (!(major >= 1)) throw fail("format", "Model file has an unreadable format version: " + JSON.stringify(ver));
   if (major > FORMAT_MAJOR) throw fail("version", `This model file uses format version ${ver}; this viewer supports major version ${FORMAT_MAJOR} and older. Update the viewer to open it.`);
   if (!Array.isArray(hdr.fields) || !(hdr.n > 0)) throw fail("format", "Model header has no fields.");
+  if (major === 2) { try { return decodeCompact(buf, hdr, hl, ver); } catch (e) { throw e.code ? e : fail("format", "Compact model file could not be read: " + e.message); } }
   const f16 = halfTable();
   let off = 4 + hl; const d = { hdr, n: hdr.n, Km: hdr.Km, Kc: hdr.Kc, Ko: hdr.Ko, frames: hdr.frames, fps: hdr.fps, version: ver, h16: {} };
   for (const [name, type, shape] of hdr.fields) {
@@ -130,6 +195,33 @@ function parseModel(buf) {
     if (type === "f4") d[name] = new Float32Array(raw);
     else { const u = new Uint16Array(raw), f = new Float32Array(cnt); for (let i = 0; i < cnt; i++) f[i] = f16[u[i]]; d[name] = f; d.h16[name] = u; }
   }
+  return d;
+}
+// Compact format 2.0 (spikes/lf_finish/FORMAT.md section B; FINISH's reference decoder): fields in order, each blob padded to 4 bytes; encodings f4, f2 (float16;
+// kept as h16 for the GPU upload), f2s (float16 x 1/scale), q16 (16-bit fixed point between lo and hi per column), cells (per control a row bit mask, then
+// float16 values for the set rows only). Returns exactly what parseModel returns for the format-1 file.
+function decodeCompact(buf, hdr, hl, ver) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength), n = hdr.n, f16 = halfTable();
+  const d = { hdr, n, Km: hdr.Km, Kc: hdr.Kc, Ko: hdr.Ko, frames: hdr.frames, fps: hdr.fps, version: ver, h16: {} };
+  let off = 4 + hl; const align = () => { off += (4 - (off % 4)) % 4; }, need = b => { if (off + b > buf.length) throw fail("format", "Model file is truncated."); };
+  const u16 = cnt => { need(2 * cnt); const u = new Uint16Array(cnt); for (let i = 0; i < cnt; i++) u[i] = dv.getUint16(off + 2 * i, true); off += 2 * cnt; return u; };
+  for (const [name, enc, shape, p = {}] of hdr.fields) {
+    const per = shape.reduce((a, b) => a * b, 1), cnt = n * per;
+    if (enc === "f4") { need(4 * cnt); const a = new Float32Array(cnt); for (let i = 0; i < cnt; i++) a[i] = dv.getFloat32(off + 4 * i, true); off += 4 * cnt; d[name] = a; }
+    else if (enc === "f2" || enc === "f2s") { const u = u16(cnt), a = new Float32Array(cnt), sc = enc === "f2s" ? 1 / p.scale : 1; for (let i = 0; i < cnt; i++) a[i] = f16[u[i]] * sc; d[name] = a; if (enc === "f2") d.h16[name] = u; }
+    else if (enc === "q16") { const u = u16(cnt), a = new Float32Array(cnt); for (let i = 0; i < n; i++) for (let c = 0; c < per; c++) a[i * per + c] = p.lo[c] + u[i * per + c] / 65535 * (p.hi[c] - p.lo[c]); d[name] = a; }
+    else if (enc === "cells") {
+      const K = shape[0], C = per / K, mb = Math.ceil(n / 8), mbp = mb + ((4 - (mb % 4)) % 4), masks = [];
+      for (let k = 0; k < K; k++) { need(mbp); masks.push(buf.subarray(off, off + mb)); off += mbp; }
+      const u = new Uint16Array(cnt);
+      for (let k = 0; k < K; k++) { const m = masks[k]; need(2 * C * (p.counts ? p.counts[k] : 0)); let c = 0;
+        for (let i = 0; i < n; i++) if (m[i >> 3] & (1 << (i & 7))) { for (let j = 0; j < C; j++) u[(i * K + k) * C + j] = dv.getUint16(off + 2 * (c * C + j), true); c++; }
+        if (!p.counts || c !== p.counts[k]) throw fail("format", `Compact model: field ${name} control ${k} row count does not match the header.`); off += 2 * c * C; }
+      const a = new Float32Array(cnt); for (let i = 0; i < cnt; i++) a[i] = f16[u[i]]; d[name] = a; d.h16[name] = u;
+    } else throw fail("format", "Compact model: unknown field encoding " + enc);
+    align();
+  }
+  if (off !== buf.length) throw fail("format", "Compact model: " + (buf.length - off) + " bytes after the last field.");
   return d;
 }
 async function fetchModel(url, onProgress) {
@@ -146,7 +238,7 @@ async function fetchModel(url, onProgress) {
 const VS = `#version 300 es
 precision highp float;
 layout(location=0) in vec2 aQuad; layout(location=1) in vec3 aCenter; layout(location=2) in vec3 aC0; layout(location=3) in vec3 aC1; layout(location=4) in vec4 aColor;
-uniform mat4 uView; uniform vec2 uFocal; uniform vec2 uViewport; uniform vec2 uPP;
+uniform mat4 uView; uniform vec2 uFocal; uniform vec2 uViewport; uniform vec2 uPP; uniform int uAA;
 out vec4 vColor; out vec2 vPos;
 void main() {
   vec4 cam = uView * vec4(aCenter, 1.0);
@@ -165,6 +257,7 @@ void main() {
   vec2 px = aQuad.x * maj + aQuad.y * mnr;
   gl_Position = vec4(ctr + vec2(px.x * 2.0 / uViewport.x, -px.y * 2.0 / uViewport.y), 0.0, 1.0);
   vColor = aColor; vPos = aQuad;
+  if (uAA == 1) vColor.a *= sqrt(max((a - 0.3) * (c - 0.3) - b * b, 0.0) / max(a * c - b * b, 1e-12));   // render: gsplat antialiased mode (models trained that way)
 }`;
 const FS = `#version 300 es
 precision highp float; in vec4 vColor; in vec2 vPos; out vec4 o;
@@ -185,7 +278,8 @@ uniform mat4 uView; uniform vec2 uFocal; uniform vec2 uViewport; uniform vec2 uP
 uniform sampler2D tGeo, tSH, tMot, tLook;
 uniform int uKm, uKl, uHead, uHwField, uNg, uNm, uNl; uniform vec4 uWm[16], uWc[16], uWo[16];
 uniform mat3 uHQ; uniform vec3 uPiv, uZf, uCam;
-uniform int uBk; uniform float uBw, uBs, uBm; uniform vec3 uBe[2];   // blink sweep (header blinkSweep): control index (-1 = none), its weight, soft, motion share, eyes [cx, top, bottom]
+uniform int uBk; uniform float uBw, uBs, uBm; uniform vec3 uBe[2];
+uniform int uAA, uShDeg; uniform vec4 uShC;   // render options (RENDER_DEFAULTS): antialiased opacity, SH degree, SH clamp (xyz = camera in the head frame at the clamped yaw, w = 1 on)   // blink sweep (header blinkSweep): control index (-1 = none), its weight, soft, motion share, eyes [cx, top, bottom]
 ivec2 tx(int t) { return ivec2(t & 2047, t >> 11); }
 // Gaussian i on screen: centre (clip units), major and minor axis (pixels), 8-bit colour. false = not drawn (faint or behind the camera)
 bool evalSplat(int i, out vec2 ctr, out vec2 maj, out vec2 mnr, out vec4 col) {
@@ -205,7 +299,7 @@ bool evalSplat(int i, out vec2 ctr, out vec2 maj, out vec2 mnr, out vec4 col) {
     float h = clamp((uBe[e].y - (p0.y + uBm * mb.y)) / (uBe[e].y - uBe[e].z), 0.0, 1.0), u = clamp(((1.0 + uBs) * uBw - h) / uBs, 0.0, 1.0), dl = u * u * (3.0 - 2.0 * u) - uBw;
     p += dl * mb; if (rl >= 0 && uBk < uKl) { vec4 c = texelFetch(tLook, tx(IX(uBk, rl, uNl, uKl)), 0); cl += dl * c.rgb; ov += dl * c.a; } }
   float a = 1.0 / (1.0 + exp(-ov));
-  bool hd = uHead == 1 && hw > 0.0;
+  bool hd = uHead == 1 && hw > 0.0; vec3 ph = p;
   if (hd) p += hw * (uPiv + uHQ * (p - uPiv) - p + uZf);
   vec4 cam = uView * vec4(p, 1.0);
   ctr = vec2(0.0); maj = vec2(0.0); mnr = vec2(0.0); col = vec4(0.0);
@@ -213,20 +307,21 @@ bool evalSplat(int i, out vec2 ctr, out vec2 maj, out vec2 mnr, out vec4 col) {
   mat3 V = mat3(g1.x, g1.y, g1.z, g1.y, g1.w, g2.x, g1.z, g2.x, g2.y);
   if (uHead == 1 && hw >= 0.5) V = uHQ * V * transpose(uHQ);
   vec3 d = p - uCam; d *= 1.0 / (length(d) + 1e-9);
-  if (hd) { vec3 e = transpose(uHQ) * d;
+  if (hd) { vec3 e = uShC.w > 0.5 ? normalize(ph - uShC.xyz) : transpose(uHQ) * d;
     if (uHwField == 1) { if (hw < 1.0) { e = d + hw * (e - d); e *= 1.0 / (length(e) + 1e-9); } d = e; } else if (hw >= 0.5) d = e; }
   vec4 s0 = texelFetch(tSH, tx(IX(0, i, uNg, 6)), 0), s1 = texelFetch(tSH, tx(IX(1, i, uNg, 6)), 0), s2 = texelFetch(tSH, tx(IX(2, i, uNg, 6)), 0), s3 = texelFetch(tSH, tx(IX(3, i, uNg, 6)), 0), s4 = texelFetch(tSH, tx(IX(4, i, uNg, 6)), 0), s5 = texelFetch(tSH, tx(IX(5, i, uNg, 6)), 0);
   float xx = d.x * d.x, yy = d.y * d.y, zz = d.z * d.z;
   vec3 c = 0.28209479177387814 * cl + 0.5;
-  c += -0.4886025119029199 * d.y * s0.xyz; c += 0.4886025119029199 * d.z * vec3(s0.w, s1.xy); c += -0.4886025119029199 * d.x * vec3(s1.zw, s2.x);
-  c += 1.0925484305920792 * d.x * d.y * s2.yzw; c += -1.0925484305920792 * d.y * d.z * s3.xyz; c += 0.31539156525252005 * (2.0 * zz - xx - yy) * vec3(s3.w, s4.xy);
-  c += -1.0925484305920792 * d.x * d.z * vec3(s4.zw, s5.x); c += 0.5462742152960396 * (xx - yy) * s5.yzw;
+  if (uShDeg >= 1) { c += -0.4886025119029199 * d.y * s0.xyz; c += 0.4886025119029199 * d.z * vec3(s0.w, s1.xy); c += -0.4886025119029199 * d.x * vec3(s1.zw, s2.x); }
+  if (uShDeg >= 2) { c += 1.0925484305920792 * d.x * d.y * s2.yzw; c += -1.0925484305920792 * d.y * d.z * s3.xyz; c += 0.31539156525252005 * (2.0 * zz - xx - yy) * vec3(s3.w, s4.xy);
+  c += -1.0925484305920792 * d.x * d.z * vec3(s4.zw, s5.x); c += 0.5462742152960396 * (xx - yy) * s5.yzw; }
   col = vec4(clamp(floor(c * 255.0), 0.0, 255.0), floor(a * 255.0));   // 0..255, cut as the CPU renderer stores them
   mat3 W = mat3(uView);
   mat3 S = W * V * transpose(W);
   float iz = 1.0 / cam.z;
   vec3 j0 = vec3(uFocal.x * iz, 0.0, -uFocal.x * cam.x * iz * iz), j1 = vec3(0.0, uFocal.y * iz, -uFocal.y * cam.y * iz * iz);
   float A = dot(j0, S * j0) + 0.3, B = dot(j0, S * j1), C = dot(j1, S * j1) + 0.3;
+  if (uAA == 1) col.a = floor(col.a * sqrt(max((A - 0.3) * (C - 0.3) - B * B, 0.0) / max(A * C - B * B, 1e-12)));   // gsplat antialiased mode (only for models trained that way)
   float mid = 0.5 * (A + C), rad = length(vec2(0.5 * (A - C), B));
   float l1 = mid + rad, l2 = max(mid - rad, 0.1);
   vec2 dg = rad < 1e-6 ? vec2(1.0, 0.0) : normalize(vec2(B, l1 - A));
@@ -254,16 +349,33 @@ void main() { int i = int(aIdx); vec4 p0 = texelFetch(tP0, tx(i), 0), p1 = texel
   if (p1.z < 0.0) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }
   float r = floor(p1.z / 256.0), b = floor(p1.w / 256.0); splat(p0.xy, p0.zw, p1.xy, vec4(r, p1.z - 256.0 * r, b, p1.w - 256.0 * b)); }`;
 
+const fsFor = ext => (ext === 4 ? FS : FS.replace("A < -4.0", "A < -" + ext.toFixed(4)));   // render.quadExtent
+// render extras: a full-screen triangle (background plate, post) and a glint quad (catchlights)
+const VS_FULL = GLSL_HEAD + `out vec2 vUv; void main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0); vUv = 0.5 * p + 0.5; gl_Position = vec4(p, 0.0, 1.0); }`;
+const FS_PLATE = GLSL_HEAD + `in vec2 vUv; out vec4 o; uniform vec3 uBg, uTint; uniform vec2 uCtr, uAsp; uniform float uLift, uFall; uniform vec4 uSh; uniform vec2 uShS; uniform float uShA;
+void main() { vec2 q = (vUv - uCtr) * uAsp; float g = exp(-dot(q, q) / (uFall * uFall)); float lum = dot(uBg, vec3(0.299, 0.587, 0.114));
+  vec3 c = lum < 0.5 ? uBg + uLift * g * uTint : uBg * (1.0 - uLift * 0.6 * (1.0 - g));   // dark: a soft lit area behind the head; light: the edges fall off instead
+  if (uShA > 0.0) { vec2 s = (vUv - uSh.xy) / uShS; float k = exp(-dot(s, s) * 2.0); c *= 1.0 - uShA * k; }
+  o = vec4(c, 1.0); }`;
+const FS_POST = GLSL_HEAD + `in vec2 vUv; out vec4 o; uniform float uVig, uGrain, uSeed; uniform vec2 uAsp;
+float hash(vec2 p) { p = fract(p * vec2(443.897, 441.423) + uSeed); p += dot(p, p.yx + 19.19); return fract((p.x + p.y) * p.x); }
+void main() { vec2 q = (vUv - 0.5) * uAsp; float v = 1.0 - uVig * smoothstep(0.25, 0.95, dot(q, q) * 1.6);
+  float n = (hash(gl_FragCoord.xy) + hash(gl_FragCoord.xy + 17.3) - 1.0) * uGrain;
+  o = vec4(vec3(0.5 * v * (1.0 + n)), 1.0); }`;   // drawn with blendFunc(DST_COLOR, SRC_COLOR): result = 2 * this * the picture
+const VS_GLINT = GLSL_HEAD + `uniform vec2 uC, uR; uniform float uK; out vec2 vQ; void main() { vec2 q = vec2((gl_VertexID & 1) == 1 ? 1.0 : -1.0, gl_VertexID >= 2 ? 1.0 : -1.0) * uK; vQ = q; gl_Position = vec4(uC + q * uR, 0.0, 1.0); }`;
+const FS_GLINT = GLSL_HEAD + `in vec2 vQ; out vec4 o; uniform vec3 uCol; uniform float uI, uHalo; void main() { float r2 = dot(vQ, vQ); float k = exp(-0.5 * r2) + uHalo * exp(-0.5 * r2 / 9.0); o = vec4(uCol * uI * k, 1.0); }`;   // additive
+
 // Depth order of the visible Gaussians, far to near: the position and culling half of evaluate() (same arithmetic, same 16-bit counting sort,
 // so the order is identical), without colour. Self-contained: it is also the body of the sort worker (see sortWorker).
 // S: { n, Km, Ko, mean, hw|null, op, fixedLook, alpha0, motH|motF, ocH|ocF, H (half -> float table), counts, dep, idx }
-// F: { wm, wo (Float32Array weights), head, Q (9, row-major), piv, zf, r2 (view row 2: x, y, z, t) }. Writes `out`, returns the count.
+// F: { wm, wo (Float32Array weights), head, Q (9, row-major), piv, zf, r2 (view row 2: x, y, z, t), cam? (render.sort "radial": camera position; the key is the distance
+// to it instead of the view depth) }. Writes `out`, returns the count.
 function sortSplats(S, F, out) {
   const { n, Km, Ko, mean, hw, op, fixedLook, alpha0, motH, motF, ocH, ocF, H, counts, dep, idx } = S, wm = F.wm, wo = F.wo;
   const bs = S.bs, bk = bs ? bs.k : -1, bw = bk >= 0 ? wm[bk] : 0, sweep = bk >= 0 && bw > 0 && bw < 1;   // blink sweep (as evalSplat; same formula as blinkSweepWeight)
   const actM = [], actO = []; for (let k = 0; k < Km; k++) if (wm[k] !== 0) actM.push(k); for (let k = 0; k < Ko; k++) if (wo[k] !== 0) actO.push(k);
   const nM = actM.length, nO = actO.length, head = !!F.head && !!hw, Q = F.Q, P = F.piv, zfx = F.zf[0], zfy = F.zf[1], zfz = F.zf[2];
-  const r2x = F.r2[0], r2y = F.r2[1], r2z = F.r2[2], t2 = F.r2[3]; let m = 0, dmin = 1e9, dmax = -1e9;
+  const r2x = F.r2[0], r2y = F.r2[1], r2z = F.r2[2], t2 = F.r2[3], C = F.cam || null; let m = 0, dmin = 1e9, dmax = -1e9;
   for (let i = 0; i < n; i++) {
     const i3 = i * 3; let x = mean[i3], y = mean[i3 + 1], z = mean[i3 + 2], o = i * Km * 3;
     if (motF) for (let q = 0; q < nM; q++) { const k = actM[q], b = wm[k], p = o + k * 3; x += b * motF[p]; y += b * motF[p + 1]; z += b * motF[p + 2]; }
@@ -275,7 +387,8 @@ function sortSplats(S, F, out) {
     if (fixedLook[i]) a = alpha0[i]; else { let ov = op[i]; o = i * Ko; for (let q = 0; q < nO; q++) { const k = actO[q]; ov += wo[k] * (ocF ? ocF[o + k] : H[ocH[o + k]]); } if (dl !== 0 && bk < Ko) ov += dl * (ocF ? ocF[o + bk] : H[ocH[o + bk]]); a = 1 / (1 + Math.exp(-ov)); }
     if (a < 0.004) continue;
     const hwi = head ? hw[i] : 0; if (hwi > 0) { const px = x - P[0], py = y - P[1], pz = z - P[2]; x += hwi * (P[0] + Q[0] * px + Q[3] * py + Q[6] * pz - x + zfx); y += hwi * (P[1] + Q[1] * px + Q[4] * py + Q[7] * pz - y + zfy); z += hwi * (P[2] + Q[2] * px + Q[5] * py + Q[8] * pz - z + zfz); }
-    const d = r2x * x + r2y * y + r2z * z + t2; if (d < 0.2) continue;
+    let d = r2x * x + r2y * y + r2z * z + t2; if (d < 0.2) continue;
+    if (C) d = Math.hypot(x - C[0], y - C[1], z - C[2]);
     idx[m] = i; dep[m] = d; if (d < dmin) dmin = d; if (d > dmax) dmax = d; m++;
   }
   counts.fill(0); const sc = 65535 / Math.max(dmax - dmin, 1e-6);
@@ -1312,22 +1425,35 @@ async function create(canvas, options = {}) {
   const controlNames = Array.isArray(rig.controls) ? rig.controls.slice() : [], named = hasRig && controlNames.length > 0;
   const Km = D.Km, Ks = rig.Ks || 0, Kh = rig.Kh || 0;
   const BS = named ? readBlinkSweep(D.hdr, controlNames, Km) : null;   // blink sweep (header blinkSweep), null for every older model
+  let RS = readRender(RENDER_DEFAULTS, options.render);          // render options (RENDER_DEFAULTS; all off by default)
+  const QEXT = clamp(+RS.quadExtent || 4, 1, 4), FSX = fsFor(QEXT), hdrAA = !!(D.hdr.antialiased || (D.hdr.render && D.hdr.render.antialiased));
+  const aaOn = () => (RS.aaCompensation === "auto" ? hdrAA : !!RS.aaCompensation), shDeg = () => clamp(Math.round(+RS.shDegree), 0, 2);
   const restOf = j => (rig.rest && Number.isFinite(rig.rest[j]) ? rig.rest[j] : 0);   // a control appended by the finish (browUp, breath, ...) may have no rest entry: 0
 
   // ---- GL setup. Two renderers draw the same picture: "gpu" (default: the model is evaluated in the vertex shader, the CPU only sorts) and "cpu"
   // (the prototype's: everything on the CPU, 40 bytes per Gaussian uploaded every frame), used when asked for (options.renderer) or when the GPU one cannot be set up.
   const mk = (t, s) => { const x = gl.createShader(t); gl.shaderSource(x, s); gl.compileShader(x); if (!gl.getShaderParameter(x, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(x)); return x; };
   const link = (vs, fs) => { const p = gl.createProgram(); gl.attachShader(p, mk(gl.VERTEX_SHADER, vs)); gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw fail("webgl2", gl.getProgramInfoLog(p)); return p; };
-  const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-2, -2, 2, -2, -2, 2, 2, 2]), gl.STATIC_DRAW);
+  const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb); { const e = Math.sqrt(QEXT); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-e, -e, e, -e, -e, e, e, e]), gl.STATIC_DRAW); }   // the splat quad (+-2 = quadExtent 4)
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   const nG = D.n, STRIDE = 40;
-  let R = null, P, uView, uFocal, uViewport, uPP, vao, ib, inst32, inst8, vx, vy, vz, vcol, vidx, vdep, counts, bm, bc, bo, actM, actC, actO;   // R: the GPU renderer's state; the rest is the CPU renderer's
+  let R = null, P, uAAc, uView, uFocal, uViewport, uPP, vao, ib, inst32, inst8, vx, vy, vz, vcol, vidx, vdep, counts, bm, bc, bo, actM, actC, actO;   // R: the GPU renderer's state; the rest is the CPU renderer's
   const fixedLook = new Uint8Array(nG), alpha0 = new Float64Array(nG);
   // evaluation shortcuts that do not change a single bit of the result: (1) only the coefficients whose weight is not zero this frame are looped over (at rest that is the gaze pair, in speech two
   // to four of nine); (2) Gaussians whose colour and opacity do not depend on any control (9 in 10) skip those loops and use an opacity computed once.
   for (let i = 0; i < nG; i++) { let z = 1; for (let k = 0, o = i * D.Ko; k < D.Ko; k++) if (D.oc[o + k] !== 0) { z = 0; break; } if (z) for (let k = 0, o = i * D.Kc * 3, e = o + D.Kc * 3; o < e; o++) if (D.cc[o] !== 0) { z = 0; break; } fixedLook[i] = z; alpha0[i] = 1 / (1 + Math.exp(-D.op[i])); }
+  const PUPILS = BS ? findPupils(D, BS, alpha0, controlNames.indexOf("gazeX"), Km) : null;
+  // controls whose trained track column is flat (max - min < 1e-6: e.g. TRAIN's expression controls in a base-only finish view) but that DO move something
+  // (a non-zero motion, colour or opacity column): their range falls back to [0, 1] below instead of [lo, lo] (which pinned them). Found here, before the GPU
+  // setup frees the arrays; only the flat columns are scanned. Every existing model (v21b, v22: no such column) is unchanged.
+  const FLAT_MOVES = (() => { const out = new Set(); if (!named || !Array.isArray(rig.track) || !rig.track.length) return out; const tr = rig.track;
+    for (let j = Ks; j < Math.min(Km, tr[0].length); j++) { let a = Infinity, b = -Infinity; for (const r of tr) { if (r[j] < a) a = r[j]; if (r[j] > b) b = r[j]; } if (!(b - a < 1e-6)) continue;
+      let mv = false; for (let i = 0; i < nG && !mv; i++) { const o = (i * Km + j) * 3; if (D.mot[o] !== 0 || D.mot[o + 1] !== 0 || D.mot[o + 2] !== 0) mv = true;
+        if (!mv && j < D.Kc) { const q = (i * D.Kc + j) * 3; if (D.cc[q] !== 0 || D.cc[q + 1] !== 0 || D.cc[q + 2] !== 0) mv = true; } if (!mv && j < D.Ko && D.oc[i * D.Ko + j] !== 0) mv = true; }
+      if (mv) out.add(j); }
+    return out; })();   // catchlight eye centres (before the GPU setup frees the base colours)
   function cpuSetup() {                                          // the prototype's renderer (ported)
-    P = link(VS, FS); gl.useProgram(P);
+    P = link(VS, FSX); gl.useProgram(P); uAAc = gl.getUniformLocation(P, "uAA");
     uView = gl.getUniformLocation(P, "uView"); uFocal = gl.getUniformLocation(P, "uFocal"); uViewport = gl.getUniformLocation(P, "uViewport"); uPP = gl.getUniformLocation(P, "uPP");
     vao = gl.createVertexArray(); gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
@@ -1387,7 +1513,7 @@ async function create(canvas, options = {}) {
     let pre = null;                                              // the evaluation pre-pass: needs float render targets (EXT_color_buffer_float)
     if (options.gpuPrepass !== false && gl.getExtension("EXT_color_buffer_float")) {
       try {
-        const Pe = link(VS_EVAL, FS_EVAL), Ps = link(VS_SPLAT, FS), h = rows(nG), fbo = gl.createFramebuffer(), outs = [];
+        const Pe = link(VS_EVAL, FS_EVAL), Ps = link(VS_SPLAT, FSX), h = rows(nG), fbo = gl.createFramebuffer(), outs = [];
         for (const unit of [4, 5]) { const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); textures.push(t); outs.push(t);
           for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
           gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, TW, h); }
@@ -1423,9 +1549,10 @@ async function create(canvas, options = {}) {
       for (let k = 0; k < Kc; k++) { const o = IX(k, r, nl, Kl) * 4, p = (i * Kc + k) * 3; lk[o] = cs[p]; lk[o + 1] = cs[p + 1]; lk[o + 2] = cs[p + 2]; }
       for (let k = 0; k < Ko; k++) lk[IX(k, r, nl, Kl) * 4 + 3] = os[i * Ko + k]; }
     upload(3, lH, lk);
-    const Pg = pre ? pre.Pe : link(VS_GPU, FS);                   // the program that evaluates the Gaussians
+    const Pg = pre ? pre.Pe : link(VS_GPU, FSX);                   // the program that evaluates the Gaussians
     gl.useProgram(Pg); const U = {};
-    for (const n of ["uView", "uFocal", "uViewport", "uPP", "tGeo", "tSH", "tMot", "tLook", "uKm", "uKl", "uHead", "uHwField", "uWm", "uWc", "uWo", "uHQ", "uPiv", "uZf", "uCam", "uVp", "uN", "uNg", "uNm", "uNl", "uBk", "uBw", "uBs", "uBm", "uBe"]) U[n] = gl.getUniformLocation(Pg, n);
+    for (const n of ["uView", "uFocal", "uViewport", "uPP", "tGeo", "tSH", "tMot", "tLook", "uKm", "uKl", "uHead", "uHwField", "uWm", "uWc", "uWo", "uHQ", "uPiv", "uZf", "uCam", "uVp", "uN", "uNg", "uNm", "uNl", "uBk", "uBw", "uBs", "uBm", "uBe", "uAA", "uShDeg", "uShC"]) U[n] = gl.getUniformLocation(Pg, n);
+    gl.uniform1i(U.uShDeg, 2); gl.uniform1i(U.uAA, 0); gl.uniform4f(U.uShC, 0, 0, 0, 0);
     gl.uniform1i(U.uBk, BS ? BS.k : -1); gl.uniform1f(U.uBw, 0); if (BS) { gl.uniform1f(U.uBs, BS.soft); gl.uniform1f(U.uBm, BS.mot); gl.uniform3fv(U.uBe, new Float32Array(BS.eyes.flat())); }
     gl.uniform1i(U.tGeo, 0); gl.uniform1i(U.tSH, 1); gl.uniform1i(U.tMot, 2); gl.uniform1i(U.tLook, 3); gl.uniform1i(U.uKm, Km); gl.uniform1i(U.uKl, Kl); gl.uniform1i(U.uN, nG); gl.uniform1i(U.uNg, nG); gl.uniform1i(U.uNm, nm); gl.uniform1i(U.uNl, nl);
     gl.uniform1i(U.uHead, head ? 1 : 0); gl.uniform1i(U.uHwField, D.hw ? 1 : 0); if (head) gl.uniform3fv(U.uPiv, head.piv);
@@ -1482,11 +1609,12 @@ async function create(canvas, options = {}) {
 
   // ---- per-frame splat evaluation + depth sort on the CPU (ported)
   let rigW = hasRig ? new Float32Array(Km) : null, phase = 0;
-  function evaluate(tau, cam, V) {
+  function evaluate(tau, cam, V, xo = NO_XO) {                  // xo (render options): { shc: camera in the head frame for the SH clamp | null, deg: SH degree, radial }
     const { n, Km: Kmm, Kc, Ko, mean, dc, op, rest, mot, cc, oc } = D, cov = head ? head.covV : D.cov, hQ = head && head.Q, hW = head && head.hw, hP = head && head.piv; if (head) headCov();
     if (hasRig) { bm.set(rigW); bc.set(rigW.subarray(0, Math.min(Km, Kc))); bo.set(rigW.subarray(0, Math.min(Km, Ko))); }   // live rig: the same linear model, weights set at run time
     else { for (let k = 0; k < Kmm; k++) bm[k] = Math.cos(Math.PI * (k + 1) * tau); for (let k = 0; k < Kc; k++) bc[k] = Math.cos(Math.PI * (k + 1) * tau); for (let k = 0; k < Ko; k++) bo[k] = Math.cos(Math.PI * (k + 1) * tau); }
     const r2x = V[2], r2y = V[6], r2z = V[10], t2 = V[14]; let m = 0, dmin = 1e9, dmax = -1e9;
+    const shc = xo.shc, g1 = xo.deg >= 1, g2 = xo.deg >= 2, rad = !!xo.radial;
     const bw = BS && hasRig ? bm[BS.k] : 0, sweep = !!BS && hasRig && bw > 0 && bw < 1;   // blink sweep (see blinkSweepWeight)
     let nM = 0, nC = 0, nO = 0; for (let k = 0; k < Kmm; k++) if (bm[k] !== 0) actM[nM++] = k; for (let k = 0; k < Kc; k++) if (bc[k] !== 0) actC[nC++] = k; for (let k = 0; k < Ko; k++) if (bo[k] !== 0) actO[nO++] = k;
     // refB models were trained with the head turning about the model origin plus an in-image shift; shifting the head along the view direction by the difference restores the trained front-to-back order at the collar
@@ -1499,16 +1627,17 @@ async function create(canvas, options = {}) {
       const fx = fixedLook[i]; let a;
       if (fx) a = alpha0[i]; else { let ov = op[i]; o = i * Ko; for (let q = 0; q < nO; q++) { const k = actO[q]; ov += bo[k] * oc[o + k]; } if (dl !== 0 && BS.k < Ko) ov += dl * oc[o + BS.k]; a = 1 / (1 + Math.exp(-ov)); }
       if (a < 0.004) continue;
-      const hwi = head ? hW[i] : 0; if (hwi > 0) { const px = x - hP[0], py = y - hP[1], pz = z - hP[2]; x += hwi * (hP[0] + hQ[0] * px + hQ[3] * py + hQ[6] * pz - x + zfx); y += hwi * (hP[1] + hQ[1] * px + hQ[4] * py + hQ[7] * pz - y + zfy); z += hwi * (hP[2] + hQ[2] * px + hQ[5] * py + hQ[8] * pz - z + zfz); }
-      const dep = r2x * x + r2y * y + r2z * z + t2; if (dep < 0.2) continue;
+      const hx = x, hy = y, hz = z, hwi = head ? hW[i] : 0; if (hwi > 0) { const px = x - hP[0], py = y - hP[1], pz = z - hP[2]; x += hwi * (hP[0] + hQ[0] * px + hQ[3] * py + hQ[6] * pz - x + zfx); y += hwi * (hP[1] + hQ[1] * px + hQ[4] * py + hQ[7] * pz - y + zfy); z += hwi * (hP[2] + hQ[2] * px + hQ[5] * py + hQ[8] * pz - z + zfz); }
+      let dep = r2x * x + r2y * y + r2z * z + t2; if (dep < 0.2) continue; if (rad) dep = Math.hypot(x - cam[0], y - cam[1], z - cam[2]);
       let cr = dc[i3], cg = dc[i3 + 1], cb = dc[i3 + 2]; if (!fx) { o = i * Kc * 3; for (let q = 0; q < nC; q++) { const k = actC[q], b = bc[k], p = o + k * 3; cr += b * cc[p]; cg += b * cc[p + 1]; cb += b * cc[p + 2]; }
         if (dl !== 0 && BS.k < Kc) { const p = o + BS.k * 3; cr += dl * cc[p]; cg += dl * cc[p + 1]; cb += dl * cc[p + 2]; } }
       let dx = x - cam[0], dy = y - cam[1], dz = z - cam[2]; const il = 1 / (Math.hypot(dx, dy, dz) + 1e-9); dx *= il; dy *= il; dz *= il;
       if (hwi > 0) { let ex = hQ[0] * dx + hQ[1] * dy + hQ[2] * dz, ey = hQ[3] * dx + hQ[4] * dy + hQ[5] * dz, ez = hQ[6] * dx + hQ[7] * dy + hQ[8] * dz;   // view direction in the head's own frame
+        if (shc) { ex = hx - shc[0]; ey = hy - shc[1]; ez = hz - shc[2]; const l = 1 / (Math.hypot(ex, ey, ez) + 1e-9); ex *= l; ey *= l; ez *= l; }   // render.shClampDeg: as seen from the clamped yaw
         if (D.hw) { if (hwi < 1) { ex = dx + hwi * (ex - dx); ey = dy + hwi * (ey - dy); ez = dz + hwi * (ez - dz); const l = 1 / (Math.hypot(ex, ey, ez) + 1e-9); ex *= l; ey *= l; ez *= l; } dx = ex; dy = ey; dz = ez; }
         else if (hwi >= 0.5) { dx = ex; dy = ey; dz = ez; } }
       const xx = dx * dx, yy = dy * dy, zz = dz * dz;
-      const B0 = -C1 * dy, B1 = C1 * dz, B2 = -C1 * dx, B3 = S2a * dx * dy, B4 = -S2a * dy * dz, B5 = S2c * (2 * zz - xx - yy), B6 = -S2a * dx * dz, B7 = S2e * (xx - yy);   // no array per Gaussian (it was 240,000 allocations a frame)
+      const B0 = g1 ? -C1 * dy : 0, B1 = g1 ? C1 * dz : 0, B2 = g1 ? -C1 * dx : 0, B3 = g2 ? S2a * dx * dy : 0, B4 = g2 ? -S2a * dy * dz : 0, B5 = g2 ? S2c * (2 * zz - xx - yy) : 0, B6 = g2 ? -S2a * dx * dz : 0, B7 = g2 ? S2e * (xx - yy) : 0;   // render.shDegree   // no array per Gaussian (it was 240,000 allocations a frame)
       let r = C0 * cr + 0.5, g = C0 * cg + 0.5, bl = C0 * cb + 0.5; const ro = i * 24;
       r += B0 * rest[ro]; g += B0 * rest[ro + 1]; bl += B0 * rest[ro + 2]; r += B1 * rest[ro + 3]; g += B1 * rest[ro + 4]; bl += B1 * rest[ro + 5]; r += B2 * rest[ro + 6]; g += B2 * rest[ro + 7]; bl += B2 * rest[ro + 8];
       r += B3 * rest[ro + 9]; g += B3 * rest[ro + 10]; bl += B3 * rest[ro + 11]; r += B4 * rest[ro + 12]; g += B4 * rest[ro + 13]; bl += B4 * rest[ro + 14]; r += B5 * rest[ro + 15]; g += B5 * rest[ro + 16]; bl += B5 * rest[ro + 17];
@@ -1529,11 +1658,115 @@ async function create(canvas, options = {}) {
     gl.bindBuffer(gl.ARRAY_BUFFER, ib); gl.bufferSubData(gl.ARRAY_BUFFER, 0, inst8, 0, m * STRIDE); return m;
   }
 
+  // ---- render extras (RENDER_DEFAULTS; spikes/lf_render): SH clamp camera, half-resolution splat target, background plate, catchlights, post. With the
+  // defaults none of this runs and the frame is the old clear + splats.
+  function headQAt(yaw, pitch, tiltYaw) {                        // the head rotation cameraMatrices() makes for this pose (front models)
+    const c = (hasRig && rig.cam_c2w) || D.hdr.cam_c2w, Rc = [c[0][0], c[0][1], c[0][2], c[1][0], c[1][1], c[1][2], c[2][0], c[2][1], c[2][2]];
+    const Ry = rodrigues([0, 1, 0], yaw), right = mv3(Ry, [Rc[0], Rc[3], Rc[6]]); let Q = mul3(rodrigues(right, pitch), Ry);
+    if (eff.roll) Q = mul3(rodrigues([Rc[2], Rc[5], Rc[8]], eff.roll), Q);   // as cameraMatrices (roll, CORE)
+    if (head.tilt) { const T = head.tilt, u = Math.min(T.e.length - 1, Math.max(0, (tiltYaw - T.y0) / T.dy)), i0 = Math.min(T.e.length - 2, Math.floor(u)), f = u - i0, a = T.e[i0], b = T.e[i0 + 1];
+      const e = [a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1]), a[2] + f * (b[2] - a[2])], ang = Math.hypot(e[0], e[1], e[2]); if (ang > 1e-6) Q = mul3(Q, rodrigues([e[0] / ang, e[1] / ang, e[2] / ang], -ang)); }
+    return Q;
+  }
+  function zfixOf(Q, V) {                                        // the zfix shift (see frameParams) for head rotation Q
+    if (!head.zfix) return head.nt ? head.nt.slice() : [0, 0, 0]; const hP = head.piv, r2 = [V[2], V[6], V[10]], qx = Q[0] * hP[0] + Q[3] * hP[1] + Q[6] * hP[2], qy = Q[1] * hP[0] + Q[4] * hP[1] + Q[7] * hP[2], qz = Q[2] * hP[0] + Q[5] * hP[1] + Q[8] * hP[2];
+    const sft = r2[0] * (hP[0] - qx) + r2[1] * (hP[1] - qy) + r2[2] * (hP[2] - qz), nt = head.nt || [0, 0, 0]; return [-r2[0] * sft + nt[0], -r2[1] * sft + nt[1], -r2[2] * sft + nt[2]];   // + the nod-pivot shift (CORE)
+  }
+  // SH clamp: past +-shClampDeg of head yaw the view direction for the colour is the one the camera had at the arc's end: the camera position in the head
+  // frame for the clamped yaw (camH = piv + Q (cam - piv - zf); with the real Q this gives exactly the unclamped direction). null = not clamping this frame.
+  function shClampCam(pos, V) {
+    const A = +RS.shClampDeg * DEG; if (!(A > 0) || !head || orbitOn || Math.abs(eff.yaw) <= A) return null;
+    const yc = clamp(eff.yaw, -A, A), Q = headQAt(yc, eff.pitch, yc), zf = zfixOf(Q, V), hP = head.piv, v = mv3(Q, [pos[0] - hP[0] - zf[0], pos[1] - hP[1] - zf[1], pos[2] - hP[2] - zf[2]]);
+    return [hP[0] + v[0], hP[1] + v[1], hP[2] + v[2]];
+  }
+  const XT = { prog: null, fbo: null, tex: null, w: 0, h: 0, eyes: null, bust: null, seed: 0, last: false };
+  const xLink = (vs, fs) => { const p = link(vs, fs), u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); for (let i = 0; i < n; i++) { const a = gl.getActiveUniform(p, i); u[a.name] = gl.getUniformLocation(p, a.name); } return { p, u }; };
+  function xProgs() { if (!XT.prog) XT.prog = { plate: xLink(VS_FULL, FS_PLATE), post: xLink(VS_FULL, FS_POST), glint: xLink(VS_GLINT, FS_GLINT), vao: gl.createVertexArray() }; return XT.prog; }
+  function target() {                                            // where the splats go this frame: the canvas, or (render.splatScale < 1) a smaller texture scaled up after
+    const s = +RS.splatScale; if (!(s > 0 && s < 1)) return { w: canvas.width, h: canvas.height, fbo: null };
+    const w = Math.max(1, Math.round(canvas.width * s)), h = Math.max(1, Math.round(canvas.height * s));
+    if (XT.w !== w || XT.h !== h || !XT.fbo) {
+      if (XT.tex) gl.deleteTexture(XT.tex); if (XT.fbo) gl.deleteFramebuffer(XT.fbo);
+      XT.tex = gl.createTexture(); gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, XT.tex); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
+      XT.fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, XT.fbo); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, XT.tex, 0); gl.bindFramebuffer(gl.FRAMEBUFFER, null); XT.w = w; XT.h = h;
+    }
+    return { w, h, fbo: XT.fbo };
+  }
+  function project(T, V, p) {                                    // model point -> target pixels (x right, y down) and depth, as the splat shaders do
+    const sc = T.h / D.hdr.img_h, fl = D.hdr.K[1][1] * sc * tele, cx = V[0] * p[0] + V[4] * p[1] + V[8] * p[2] + V[12], cy = V[1] * p[0] + V[5] * p[1] + V[9] * p[2] + V[13], cz = V[2] * p[0] + V[6] * p[1] + V[10] * p[2] + V[14];
+    return [fl * cx / cz + T.w / 2 + (D.hdr.K[0][2] - D.hdr.img_w / 2) * sc, fl * cy / cz + D.hdr.K[1][2] * sc, cz, fl];
+  }
+  function bustInfo() {                                          // the torso's lower edge (for the contact shadow): opaque body Gaussians' 3rd percentile height, x extent
+    if (XT.bust) return XT.bust; const m = D.mean, hw = head ? head.hw : null, ys = [], xs = [];
+    for (let i = 0; i < nG; i++) { if (hw && hw[i] > 0.01) continue; if (alpha0[i] < 0.5) continue; ys.push(m[i * 3 + 1]); xs.push(m[i * 3]); }
+    if (ys.length < 50) return (XT.bust = { ok: false }); ys.sort((a, b) => a - b); xs.sort((a, b) => a - b); const q = (a, f) => a[Math.floor(f * (a.length - 1))];
+    const y0 = q(ys, 0.03); let zs = 0, k = 0; for (let i = 0; i < nG; i++) if ((!hw || hw[i] <= 0.01) && alpha0[i] >= 0.5 && Math.abs(m[i * 3 + 1] - y0) < 0.02) { zs += m[i * 3 + 2]; k++; }
+    return (XT.bust = { ok: true, y: y0, x0: q(xs, 0.02), x1: q(xs, 0.98), z: k ? zs / k : 0 });
+  }
+  function eyeCentres(cl) {                                      // catchlight sphere centres in the model frame (head at rest)
+    if (Array.isArray(cl.eyes) && cl.eyes.length === 2) return cl.eyes.map(e => e.map(Number));
+    if (XT.eyes) return XT.eyes; if (!BS) return (XT.eyes = []);
+    const m = D.mean, hw = head ? head.hw : null, r = +cl.radius || 0.012;
+    XT.eyes = BS.eyes.map(([cx0, top, bot], k) => { const pu = PUPILS && PUPILS[k], cx = pu ? pu[0] : cx0, cy = pu ? pu[1] : 0.5 * (top + bot), zs = [];   // pupil (load time) or the lid box's middle
+      for (let i = 0; i < nG; i++) { const x = m[i * 3], y = m[i * 3 + 1]; if (Math.abs(x - cx) > 0.0025 || Math.abs(y - cy) > 0.0025 || alpha0[i] < 0.3 || (hw && hw[i] < 0.5)) continue; zs.push(m[i * 3 + 2]); }
+      if (!zs.length) return null; zs.sort((a, b) => a - b); return [cx, cy, zs[Math.floor(0.95 * (zs.length - 1))] - r]; }).filter(Boolean);
+    return XT.eyes;
+  }
+  function toWorld(p, Q, zf) {                                   // a head point (hw = 1) where the head is now
+    if (!head) return p; const hP = head.piv, d = [p[0] - hP[0], p[1] - hP[1], p[2] - hP[2]];
+    return [hP[0] + Q[0] * d[0] + Q[3] * d[1] + Q[6] * d[2] + zf[0], hP[1] + Q[1] * d[0] + Q[4] * d[1] + Q[7] * d[2] + zf[1], hP[2] + Q[2] * d[0] + Q[5] * d[1] + Q[8] * d[2] + zf[2]];
+  }
+  function glints(V, pos) {                                      // this frame's catchlights: [{ x, y (canvas px), s (sigma px), i, col }]
+    const cl = RS.catchlights; if (!cl) return []; const E = eyeCentres(cl); if (!E.length) return [];
+    const T = { w: canvas.width, h: canvas.height }, Q = head ? head.Q : [1, 0, 0, 0, 1, 0, 0, 0, 1], zf = head ? zfixOf(Q, V) : [0, 0, 0], r = +cl.radius || 0.012, out = [];
+    const fw = head ? [Q[6], Q[7], Q[8]] : [0, 0, 1], bk = BS ? BS.k : ctlIndex("blink"), bw = rigW && bk >= 0 ? rigW[bk] : 0;
+    const c0 = Math.cos(cl.fadeDeg[0] * DEG), c1 = Math.cos(cl.fadeDeg[1] * DEG);
+    for (const e of E) {
+      const c = toWorld(e, Q, zf);
+      for (const L of cl.lights) {
+        const az = (+L.az || 0) * DEG, el = (+L.el || 0) * DEG, lc = [Math.sin(az) * Math.cos(el), -Math.sin(el), -Math.cos(az) * Math.cos(el)];   // camera frame (x right, y down, z forward), toward the light
+        const l = [V[0] * lc[0] + V[1] * lc[1] + V[2] * lc[2], V[4] * lc[0] + V[5] * lc[1] + V[6] * lc[2], V[8] * lc[0] + V[9] * lc[1] + V[10] * lc[2]];   // world (V's rotation transposed)
+        const g = catchlightPoint(c, pos, l, r), hdot = g[3] * fw[0] + g[4] * fw[1] + g[5] * fw[2]; let vis = ss((hdot - c1) / Math.max(1e-6, c0 - c1));
+        if (bw > 0) { const yh = e[1] + r * (Q[3] * g[3] + Q[4] * g[4] + Q[5] * g[5]);   // the glint's height on the resting eye (head frame) -> how far the lid has swept over it
+          const be = BS ? (Math.abs(e[0] - BS.eyes[0][0]) <= Math.abs(e[0] - BS.eyes[1][0]) ? BS.eyes[0] : BS.eyes[1]) : null, sw = be ? blinkSweepWeight(bw, clamp((be[1] - yh) / (be[1] - be[2]), 0, 1), BS.soft) : bw; vis *= (1 - ss((sw - 0.12) / 0.33)) * (1 - ss((bw - 0.12) / 0.16)); }   // the visible lid runs ahead of the sweep's height model: also gone by blink 0.28
+        if (vis <= 0.002) continue;
+        const pr = project(T, V, g); if (!(pr[2] > 0.2)) continue;
+        out.push({ x: pr[0], y: pr[1], s: Math.max(+cl.minPx || 0, (+L.size || 0.0005) * pr[3] / pr[2]), i: (+L.intensity || 0) * vis, col: L.color || [1, 1, 1] });
+      }
+    }
+    return out;
+  }
+  function beginFrame(T, bgc, V) {                                  // bind the splat target, clear it, draw the background plate (render.post.plate / shadow)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, T.fbo); gl.viewport(0, 0, T.w, T.h);
+    const [cr, cg, cb] = hexRgb(bgc); gl.clearColor(cr, cg, cb, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    const po = RS.post; if (!po || !(po.plate || po.shadow)) return;
+    const X = xProgs(), u = X.plate.u, pl = po.plate || {}, sh = po.shadow || null; gl.useProgram(X.plate.p); gl.disable(gl.BLEND); gl.bindVertexArray(X.vao);
+    const asp = T.w / T.h; gl.uniform3f(u.uBg, cr, cg, cb); gl.uniform3fv(u.uTint, pl.tint || [1, 1, 1]); gl.uniform2fv(u.uCtr, pl.centre || [0.5, 0.4]); gl.uniform2f(u.uAsp, asp, 1);
+    gl.uniform1f(u.uLift, po.plate ? +pl.lift || 0 : 0); gl.uniform1f(u.uFall, +pl.falloff || 0.9);
+    const b = sh ? bustInfo() : null;
+    if (b && b.ok) { const a = project(T, V, [b.x0, b.y, b.z]), c = project(T, V, [b.x1, b.y, b.z]), mid = project(T, V, [0.5 * (b.x0 + b.x1), b.y, b.z]), wpx = Math.abs(c[0] - a[0]);
+      gl.uniform4f(u.uSh, mid[0] / T.w, 1 - mid[1] / T.h, 0, 0); gl.uniform2f(u.uShS, Math.max(1e-3, (sh.width || 1) * wpx * 0.5 / T.w), Math.max(1e-3, (sh.height || 0.2) * wpx / T.h)); gl.uniform1f(u.uShA, +sh.amount || 0); }
+    else gl.uniform1f(u.uShA, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3); gl.enable(gl.BLEND);
+  }
+  function endFrame(T, V, pos) {                                 // scale the splat target up, then catchlights and post on the canvas
+    if (T.fbo) { gl.bindFramebuffer(gl.READ_FRAMEBUFFER, T.fbo); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null); gl.blitFramebuffer(0, 0, T.w, T.h, 0, 0, canvas.width, canvas.height, gl.COLOR_BUFFER_BIT, gl.LINEAR); gl.bindFramebuffer(gl.FRAMEBUFFER, null); }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    const G = RS.catchlights ? glints(V, pos) : [], po = RS.post, pv = po && (po.vignette > 0 || po.grain > 0);
+    if (!G.length && !pv) return;
+    const X = xProgs(); gl.bindVertexArray(X.vao);
+    if (G.length) { const u = X.glint.u, cl = RS.catchlights; gl.useProgram(X.glint.p); gl.blendFunc(gl.ONE, gl.ONE); gl.uniform1f(u.uHalo, +cl.halo || 0); gl.uniform1f(u.uK, cl.halo > 0 ? 9 : 3.2);
+      for (const g of G) { gl.uniform2f(u.uC, 2 * g.x / canvas.width - 1, 1 - 2 * g.y / canvas.height); gl.uniform2f(u.uR, 2 * g.s / canvas.width, 2 * g.s / canvas.height); gl.uniform3fv(u.uCol, g.col); gl.uniform1f(u.uI, g.i); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); } }
+    if (pv) { const u = X.post.u; gl.useProgram(X.post.p); gl.blendFunc(gl.DST_COLOR, gl.SRC_COLOR); gl.uniform1f(u.uVig, +po.vignette || 0); gl.uniform1f(u.uGrain, +po.grain || 0);
+      gl.uniform1f(u.uSeed, (XT.seed = (XT.seed + 0.6180339887) % 1)); gl.uniform2f(u.uAsp, canvas.width / canvas.height, 1); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
   // ---- GPU renderer, per frame. A loop frame hands its weights and pose to the sort worker and is drawn when the worker returns that frame's own
   // depth order (a few milliseconds later, normally before the screen is next composited); while the worker is busy only the newest frame waits.
   // Drawing with an order sorted for an earlier frame was measured and rejected: half a degree of turn or one frame of mouth motion already moves
   // single pixels by 20-40 levels (working-docs/spikes/render/LOG.md). renderOnce and pages without workers sort on the main thread.
-  function frameParams(tau, V) {                                 // the inputs of sortSplats for this frame (copies: the worker gets them)
+  function frameParams(tau, V, pos) {                                 // the inputs of sortSplats for this frame (copies: the worker gets them)
     let wm, wc, wo;
     if (hasRig) { wm = Float32Array.from(rigW); const cut = K => { if (K === Km) return wm; const a = new Float32Array(K); a.set(wm.subarray(0, Math.min(K, Km))); return a; }; wc = cut(D.Kc); wo = cut(D.Ko); }
     else { const cb = K => { const w = new Float32Array(K); for (let k = 0; k < K; k++) w[k] = Math.cos(Math.PI * (k + 1) * tau); return w; }; wm = cb(Km); wc = cb(D.Kc); wo = cb(D.Ko); }
@@ -1541,26 +1774,30 @@ async function create(canvas, options = {}) {
     if (head) { const hQ = head.Q, hP = head.piv; Q = hQ.slice();
       if (head.zfix) { const qx = hQ[0] * hP[0] + hQ[3] * hP[1] + hQ[6] * hP[2], qy = hQ[1] * hP[0] + hQ[4] * hP[1] + hQ[7] * hP[2], qz = hQ[2] * hP[0] + hQ[5] * hP[1] + hQ[8] * hP[2], sft = r2[0] * (hP[0] - qx) + r2[1] * (hP[1] - qy) + r2[2] * (hP[2] - qz); zf = [-r2[0] * sft, -r2[1] * sft, -r2[2] * sft]; }
       if (head.nt) zf = [zf[0] + head.nt[0], zf[1] + head.nt[1], zf[2] + head.nt[2]]; }
-    return { wm, wc, wo, head: !!head, Q, piv: head ? head.piv : null, zf, r2 };
+    const F = { wm, wc, wo, head: !!head, Q, piv: head ? head.piv : null, zf, r2 }; if (RS.sort === "radial" && pos) F.cam = [pos[0], pos[1], pos[2]]; return F;
   }
   const sameSig = (a, b) => !!a && !!b && a.length === b.length && a.every((x, k) => x === b[k]);
-  function gpuDraw(f, m) {                                       // f: { F, V, pos, bg }; m: number of Gaussians in the order buffer
-    const r = R, U = r.U, F = f.F, pre = r.pre, [pm, pc, po] = r.wpad;
-    const sc = canvas.height / D.hdr.img_h, fl = D.hdr.K[1][1] * sc * tele;   // the training crop fills the canvas height
+  function gpuDraw(f, m) {                                       // f: { F, V, pos, bg, shc }; m: number of Gaussians in the order buffer
+    const r = R, U = r.U, F = f.F, pre = r.pre, [pm, pc, po] = r.wpad, T = target();   // T: the canvas, or the smaller splat target (render.splatScale)
+    const sc = T.h / D.hdr.img_h, fl = D.hdr.K[1][1] * sc * tele;   // the training crop fills the canvas height
     gl.useProgram(r.P);
-    gl.uniformMatrix4fv(U.uView, false, f.V); gl.uniform2f(U.uFocal, fl, fl); gl.uniform2f(U.uViewport, canvas.width, canvas.height); gl.uniform2f(U.uVp, canvas.width, canvas.height);
-    gl.uniform2f(U.uPP, canvas.width / 2 + (D.hdr.K[0][2] - D.hdr.img_w / 2) * sc, D.hdr.K[1][2] * sc);   // principal point: row 640 of the ring frame, not the crop centre
+    gl.uniformMatrix4fv(U.uView, false, f.V); gl.uniform2f(U.uFocal, fl, fl); gl.uniform2f(U.uViewport, T.w, T.h); gl.uniform2f(U.uVp, T.w, T.h);
+    gl.uniform2f(U.uPP, T.w / 2 + (D.hdr.K[0][2] - D.hdr.img_w / 2) * sc, D.hdr.K[1][2] * sc);   // principal point: row 640 of the ring frame, not the crop centre
+    gl.uniform1i(U.uAA, aaOn() ? 1 : 0); gl.uniform1i(U.uShDeg, shDeg()); if (f.shc) gl.uniform4f(U.uShC, f.shc[0], f.shc[1], f.shc[2], 1); else gl.uniform4f(U.uShC, 0, 0, 0, 0);
     pm.fill(0); pm.set(F.wm); pc.fill(0); pc.set(F.wc); po.fill(0); po.set(F.wo);
     gl.uniform4fv(U.uWm, pm); gl.uniform4fv(U.uWc, pc); gl.uniform4fv(U.uWo, po); gl.uniform3f(U.uCam, f.pos[0], f.pos[1], f.pos[2]);
     if (BS) gl.uniform1f(U.uBw, F.wm[BS.k]);
     if (F.Q) { r.hq.set(F.Q); gl.uniformMatrix3fv(U.uHQ, false, r.hq); gl.uniform3f(U.uZf, F.zf[0], F.zf[1], F.zf[2]); }
     if (pre) {                                                   // pre-pass: one fragment per Gaussian
       gl.bindFramebuffer(gl.FRAMEBUFFER, pre.fbo); gl.viewport(0, 0, 2048, pre.h); gl.disable(gl.BLEND); gl.bindVertexArray(pre.evao); gl.drawArrays(gl.TRIANGLES, 0, 3);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height); gl.enable(gl.BLEND); gl.useProgram(pre.Ps); gl.uniform2f(pre.uVp, canvas.width, canvas.height);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height); gl.enable(gl.BLEND); gl.useProgram(pre.Ps); gl.uniform2f(pre.uVp, T.w, T.h);
     }
-    const [cr, cg, cb] = hexRgb(f.bg); gl.clearColor(cr, cg, cb, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!xOn()) { const [cr, cg, cb] = hexRgb(f.bg); gl.clearColor(cr, cg, cb, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
+    else { beginFrame(T, f.bg, f.V); gl.useProgram(pre ? pre.Ps : r.P); }
     gl.bindVertexArray(r.vao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, m);
+    if (xOn()) endFrame(T, f.V, f.pos);
   }
+  function xOn() { const s = +RS.splatScale; return !!(RS.catchlights || RS.post || (s > 0 && s < 1)); }   // any render extra this frame (else: the old clear + draw)
   function gpuPost(f) { const r = R, buf = r.wbuf; r.wbuf = null; r.inflight = f; r.wk.w.postMessage({ gen: r.gen, F: f.F, buf }, [buf.buffer]); }
   function workerDone(d) {                                       // the order for the frame in flight: upload, draw, report the frame; then the newest waiting frame goes
     const r = R, f = r.inflight; r.inflight = null;
@@ -1580,11 +1817,14 @@ async function create(canvas, options = {}) {
   const SY = isObj(rig.synth) && isObj(rig.synth.controls) ? rig.synth.controls : {}, ranges = { ...(isObj(rig.ranges) ? rig.ranges : {}) };
   for (const k of Object.keys(SY)) if (isObj(SY[k]) && Number.isFinite(+SY[k].min) && Number.isFinite(+SY[k].max)) ranges[k] = [+SY[k].min, +SY[k].max];
   const synth = (Array.isArray(rig.synthetic) ? rig.synthetic : []).concat(Object.keys(SY));
+  const flatNote = [];
   const ctlInfo = controlNames.slice(0, Number.isFinite(Km) ? Km : controlNames.length).map((name, index) => {
     const speech = index < Ks, rest = restOf(index), tw = !!stats && index < stats.lo.length && !(name in SY), rg = Array.isArray(ranges[name]) && ranges[name].length === 2 && ranges[name].every(Number.isFinite) ? ranges[name].map(Number) : null;
     const c = { name, index, kind: speech ? "speech" : "free", min: speech ? 0 : rg ? rg[0] : (tw ? stats.lo[index] : -1), max: speech ? 1 : rg ? rg[1] : (tw ? stats.hi[index] : 1), rest, trained: tw ? [stats.lo[index], stats.hi[index]] : null };
+    if (!speech && !rg && tw && FLAT_MOVES.has(index)) { c.min = 0; c.max = 1; c.flatTrack = true; flatNote.push(name); }   // flat track, but the control moves the model
     if (synth.includes(name)) c.synthetic = true; return c;
   });
+  if (flatNote.length) console.info("OpenAvatar viewer: controls with a flat track column but trained motion get the range [0, 1]: " + flatNote.join(", "));
   const ctlIndex = n => { const i = controlNames.indexOf(n); return i < ctlInfo.length ? i : -1; };
   const manual = {};                                             // explicit values from setControls; they override the driver and idle motion
   let bg = options.background || "#000000";
@@ -1840,7 +2080,7 @@ async function create(canvas, options = {}) {
   let lastSig = null, lastBg = null;                            // what the last frame depended on: a loop frame with the same inputs is not drawn again (the canvas keeps its picture)
   const fixed = options.size || null, pixelRatio = options.pixelRatio;
   function resize() {
-    const dpr = pixelRatio || Math.min(globalThis.devicePixelRatio || 1, 2), w = fixed ? fixed.width : Math.round(canvas.clientWidth * dpr), h = fixed ? fixed.height : Math.round(canvas.clientHeight * dpr);
+    const d0 = pixelRatio || Math.min(globalThis.devicePixelRatio || 1, 2), ssf = +RS.supersample, dpr = ssf > 1 && !pixelRatio ? Math.min(d0 * ssf, Math.max(d0, +RS.maxDpr || 3)) : d0, w = fixed ? fixed.width : Math.round(canvas.clientWidth * dpr), h = fixed ? fixed.height : Math.round(canvas.clientHeight * dpr);
     if (w < 1 || h < 1) return false;
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); dirty = true; lastSig = null; } return true;
   }
@@ -1879,24 +2119,31 @@ async function create(canvas, options = {}) {
     if (hasRig && named) lifeAfterPose(dt);
     const tau = Math.min(phase * D.fps / Math.max(1, D.frames - 1), 1), { V, pos } = cameraMatrices();
     const info = { fps, visible: count, n: nG, yaw: eff.yaw, pitch: eff.pitch, orbit: eff.orbit, speaking: speakingNow() };
-    const sig = frameSig(tau, V), same = !exact && bg === lastBg && sameSig(sig, lastSig);
+    const sig = frameSig(tau, V), same = !exact && bg === lastBg && sameSig(sig, lastSig) && !(RS.post && RS.post.grain > 0), shc = shClampCam(pos, V);   // animated grain redraws every loop frame
     const took = () => { const ms = performance.now() - tc0; cpuMs = cpuMs ? cpuMs + 0.1 * (ms - cpuMs) : ms; cpuLast = ms; };
     lastSig = sig; lastBg = bg;
     if (same) { skipped++; took(); if (!(R && (R.inflight || R.queued))) frameDone(now, info); return; }   // nothing the picture depends on changed: the canvas keeps it (a frame still waiting for the worker reports itself when drawn)
     if (R) {
-      const f = { F: frameParams(tau, V), V, pos, bg, now, info, gen: 0 };
+      const f = { F: frameParams(tau, V, pos), V, pos, bg, now, info, gen: 0, shc };
       if (exact) R.gen++;                                          // a frame drawn now outdates any loop frame still waiting for the worker
       f.gen = R.gen;
+      const se = Math.max(1, Math.round(+RS.sortEvery || 1));       // render.sortEvery: draw now with the last order on the frames in between (no wait for the worker)
+      if (se > 1 && (!exact || RS.sortEveryExact) && R.order && R.skipN < se - 1 && !R.inflight && !R.queued) { R.skipN++; took(); gpuDraw(f, count); frameDone(now, info); return; }
+      R.skipN = 0; R.order = true;
       if (!exact && R.wk) { if (R.inflight) R.queued = f; else gpuPost(f); took(); return; }   // drawn in workerDone
       const t0 = performance.now(); count = sortSplats(R.S, f.F, R.out); R.sortMs = performance.now() - t0; R.nMain++;
       gl.bindBuffer(gl.ARRAY_BUFFER, R.ob); gl.bufferSubData(gl.ARRAY_BUFFER, 0, R.out, 0, count); took(); gpuDraw(f, count);
     } else {
-      count = evaluate(tau, pos, V); took();
-      const [r, g, b] = hexRgb(bg); gl.clearColor(r, g, b, 1); gl.clear(gl.COLOR_BUFFER_BIT);
-      const sc = canvas.height / D.hdr.img_h, f = D.hdr.K[1][1] * sc * tele;   // the training crop fills the canvas height
-      gl.uniformMatrix4fv(uView, false, V); gl.uniform2f(uFocal, f, f); gl.uniform2f(uViewport, canvas.width, canvas.height);
-      gl.uniform2f(uPP, canvas.width / 2 + (D.hdr.K[0][2] - D.hdr.img_w / 2) * sc, D.hdr.K[1][2] * sc);   // principal point: row 640 of the ring frame, not the crop centre
+      const xo = shc || RS.shDegree !== 2 || RS.sort === "radial" ? { shc, deg: shDeg(), radial: RS.sort === "radial" } : NO_XO;
+      count = evaluate(tau, pos, V, xo); took();
+      const x = xOn(), T = x ? target() : { w: canvas.width, h: canvas.height, fbo: null };
+      if (!x) { const [r, g, b] = hexRgb(bg); gl.clearColor(r, g, b, 1); gl.clear(gl.COLOR_BUFFER_BIT); } else beginFrame(T, bg, V);
+      gl.useProgram(P); gl.uniform1i(uAAc, aaOn() ? 1 : 0);
+      const sc = T.h / D.hdr.img_h, f = D.hdr.K[1][1] * sc * tele;   // the training crop fills the canvas height
+      gl.uniformMatrix4fv(uView, false, V); gl.uniform2f(uFocal, f, f); gl.uniform2f(uViewport, T.w, T.h);
+      gl.uniform2f(uPP, T.w / 2 + (D.hdr.K[0][2] - D.hdr.img_w / 2) * sc, D.hdr.K[1][2] * sc);   // principal point: row 640 of the ring frame, not the crop centre
       gl.bindVertexArray(vao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+      if (x) endFrame(T, V, pos);
     }
     frameDone(now, info);
   }
@@ -1935,7 +2182,10 @@ async function create(canvas, options = {}) {
     setAutoOrbit(on, now) { if (orb) { orb.auto = !!on; if (now) orb.gainP = followTarget(); applyPose(); dirty = true; } return !!orb && orb.auto; },
     setPose(p) { if (p.yaw !== undefined) base.yaw = +p.yaw; if (p.pitch !== undefined) base.pitch = +p.pitch; if (p.zoom !== undefined) base.zoom = clamp(+p.zoom, 0.25, 2.5); if (p.orbit !== undefined && orbitOn) base.orbit = +p.orbit; if (p.roll !== undefined && Number.isFinite(+p.roll)) base.roll = +p.roll; applyPose(); dirty = true; return api.pose; },
     getPreset() { return JSON.parse(JSON.stringify(preset)); },
-    setPreset(p) { const next = mergeDeep(DEFAULT_PRESET, p || {}); const was = preset.driver.name; preset = next; if (was !== next.driver.name || !driver) selectDriver(); if (source && !source.fixedLookahead) source.setLookahead(preset.driver.lookahead); dirty = true; return api.getPreset(); },
+    // render options (RENDER_DEFAULTS): merged onto the current ones; null turns catchlights / post off; quadExtent is fixed at create
+    setRender(o) { RS = readRender(RS, o || {}); lastSig = null; dirty = true; return api.getRender(); },
+    getRender() { return JSON.parse(JSON.stringify({ ...RS, quadExtent: QEXT, antialiasedModel: hdrAA, aaActive: aaOn() })); },
+    setPreset(p) { if (p && p.render) api.setRender(p.render); const next = mergeDeep(DEFAULT_PRESET, p || {}); const was = preset.driver.name; preset = next; if (was !== next.driver.name || !driver) selectDriver(); if (source && !source.fixedLookahead) source.setLookahead(preset.driver.lookahead); dirty = true; return api.getPreset(); },
     getPresetName() { return preset.driver.name; },
     setDriver(name, o = {}) {                                    // settings go into the preset; { track } / { timings } are runtime data for the timed driver
       const { track, timings, phones, words, ...settings } = o; if (name && name !== "none" && !driverRegistry[name]) throw new Error("unknown driver " + name);
@@ -2008,6 +2258,6 @@ async function create(canvas, options = {}) {
 function registerDriver(name, factory) { driverRegistry[name] = factory; }
 // a driver on its own, for tests and for pages that want the weights without a viewer: makeDriver(name, { controls, Ks, index(name), settings() })
 function makeDriver(name, env) { const f = driverRegistry[name]; if (!f) throw new Error("unknown driver " + name); return f(env); }
-export const OpenAvatarViewer = { create, GAZE_CAL, FREE_HEAD, ROLL_DEFAULT_DEG, nodCurve, wordsFromTimings, analysePcm, softLimit, registerDriver, makeDriver, makeRelease, makeBlinker, blinkSweepWeight, blinkSweepHeight, readBlinkSweep, SPEECH_RELEASE_S, SPEECH_RELEASE_MOUTH_S, followCurve, FORMAT_MAJOR, DEFAULT_PRESET, VISEME_WEIGHTS, lettersToVisemes, timingsToPhones, wordToPhones, phonesToTrack,
+export const OpenAvatarViewer = { create, RENDER_DEFAULTS, RENDER_PROFILES, CATCHLIGHT_DEFAULTS, PORTRAIT_POST, catchlightPoint, GAZE_CAL, FREE_HEAD, ROLL_DEFAULT_DEG, nodCurve, wordsFromTimings, analysePcm, softLimit, registerDriver, makeDriver, makeRelease, makeBlinker, blinkSweepWeight, blinkSweepHeight, readBlinkSweep, SPEECH_RELEASE_S, SPEECH_RELEASE_MOUTH_S, followCurve, FORMAT_MAJOR, DEFAULT_PRESET, VISEME_WEIGHTS, lettersToVisemes, timingsToPhones, wordToPhones, phonesToTrack,
   setLexicon, loadLexicon, lexiconInfo };
 export default OpenAvatarViewer;

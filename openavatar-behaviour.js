@@ -167,7 +167,7 @@ export function analyseClip(pcm, sr, opts = {}) {
 }
 
 // ------------------------------------------------------------------ LLM expression tags (section 3.6.2)
-export const TAGS = ["smile", "thinks", "brow", "frown", "glance", "nod", "shake", "grin", "wide", "wink"];
+export const TAGS = ["smile", "thinks", "brow", "frown", "glance", "nod", "shake", "grin", "wide", "wink", "laugh"];
 // "That's a good question. [thinks] I'd start with... [smile] the boring answer." -> { text (what goes to TTS), tags: [{ name, index }] }
 // index = position in the CLEAN text the tag stood before. Unknown [words] are left in the text.
 export function parseTags(text) {
@@ -274,7 +274,11 @@ export const DEFAULT_BEHAVIOUR = {
   maxNodDeg: 4, headAccel: 90,  // deg/s^2: the per-frame velocity change bound at 60 fps (1.5 deg/s per frame; motion spike: 1.5-1.95 after)
   prosody: { pitchDegPerZ: 0.9, pitchUpMax: 1.6, pitchDownMax: 1.0, nodDeg: [1.0, 2.6], browUp: 0.55, vowelGain: 0.1, vowelMin: 0.9, vowelMax: 1.1 },
   breath: { periodS: [3.8, 5], amp: 0.55, deep: 1, standInZoom: 0.0015, standInPitchDeg: 0.06 },
-  smileShare: 0.3               // smiling speech: this share of oo moves to ee per unit of smile (section 3.1.8)
+  smileShare: 0.3,              // smiling speech: this share of oo moves to ee per unit of smile (section 3.1.8)
+  // trained expression controls (spikes/lf_train x*, models v23+; spikes/lf_expr): used when the model has them, else the synthetic / stand-in ones.
+  // Weight 1 = the generated still's full expression (strong), so the cues stay well below it; caps hold every sum.
+  expr: { brow: 0.6, browMax: 0.6, frown: 0.5, frownMax: 0.6, eyeSmile: 0.35, eyeSmileMax: 0.5, grin: 0.5, laugh: 0.6, openMax: 0.65, wide: 0.5, wideMax: 0.6,
+          sadPerValence: 0.35, sadMax: 0.3, smileAh: 0.5, smileAhMax: 0.4, laughSmile: 0.3, joyValence: 0.6, joyOpen: 0.25, joyRefractoryS: 12 }
 };
 
 // ------------------------------------------------------------------ the engine: pure, stepped once per frame (tests drive it directly)
@@ -438,16 +442,28 @@ export function createEngine(o = {}) {
   function longBlink() { doBlink("long"); emit("cue", { name: "longblink", t: T }); }   // the viewer's long blink (~0.6 s: close 0.13, shut 0.27, open 0.2)
 
   function smile(amount, dur, rise = 0.3) { pulse(ctl("smile"), dur, amount, u => envelope(u * dur, dur, rise, Math.min(persona.smileFadeS, dur * 0.6))); }
-  function brow(amount, dur = 0.8) { if (has("browUp")) pulse(ctl("browUp"), dur, amount * persona.expressiveness, u => envelope(u * dur, dur, 0.18, 0.45)); else pulse("pitch", dur, 0.6 * amount, bump); }
+  function brow(amount, dur = 0.8) {
+    if (has("xBrowUp")) pulse(ctl("xBrowUp"), dur, amount * cfg.expr.brow * persona.expressiveness, u => envelope(u * dur, dur, 0.18, 0.45));   // trained brow raise (forehead lines)
+    else if (has("browUp")) pulse(ctl("browUp"), dur, amount * persona.expressiveness, u => envelope(u * dur, dur, 0.18, 0.45)); else pulse("pitch", dur, 0.6 * amount, bump);
+  }
+  const env = (dur, rise, fall) => u => envelope(u * dur, dur, rise, fall);
+  // an open, toothy smile (grin / laugh / joy): xSmileOpen with smile (its still has smile 1); faded out while she talks (stepped below)
+  function openSmile(amount, dur, rise = 0.2) { smile(Math.min(1, amount * 1.2), dur, rise); pulse(ctl("xSmileOpen"), dur, amount, env(dur, rise, Math.min(0.6, dur * 0.4))); }
   function cue(name, opts = {}) {
     const k = (opts.strength ?? 1) * persona.expressiveness, at = opts.at ?? T, untilT = opts.until;
     if (at > T + 1e-6) { pulses.push({ ch: "cue", t0: at, dur: 0.02, amp: 0, shape: () => 0, cue: { name, opts: { ...opts, at: undefined } } }); return; }
     const dur = opts.dur || (untilT ? Math.max(0.6, untilT - T) : null);
     switch (name) {
-      case "smile": smile(0.35 * k, dur || 2.2); break;
-      case "grin": smile(0.75 * k, dur || 1.4, 0.2); if (has("blink")) pulse(ctl("blink"), dur || 1.4, 0.12, u => bump(u)); break;   // a grin narrows the eyes a touch
+      case "smile": smile(0.35 * k, dur || 2.2); if (has("xEyeSmile")) pulse(ctl("xEyeSmile"), dur || 2.2, cfg.expr.eyeSmile * k, env(dur || 2.2, 0.35, Math.min(persona.smileFadeS, (dur || 2.2) * 0.6))); break;   // a Duchenne smile: the eyes smile too
+      case "grin":
+        if (has("xSmileOpen")) { openSmile(cfg.expr.grin * k, dur || 1.4); if (has("xEyeSmile")) pulse(ctl("xEyeSmile"), dur || 1.4, 0.5 * cfg.expr.eyeSmile * k, env(dur || 1.4, 0.2, 0.5)); break; }
+        smile(0.75 * k, dur || 1.4, 0.2); if (has("blink")) pulse(ctl("blink"), dur || 1.4, 0.12, u => bump(u)); break;   // a grin narrows the eyes a touch
+      case "laugh":
+        if (has("xSmileOpen")) { openSmile(cfg.expr.laugh * k, dur || 1.8, 0.15); if (has("xEyeSmile")) pulse(ctl("xEyeSmile"), dur || 1.8, cfg.expr.eyeSmile * k, env(dur || 1.8, 0.15, 0.6)); }
+        else { smile(0.8 * k, dur || 1.8, 0.15); if (has("blink")) pulse(ctl("blink"), dur || 1.8, 0.15, u => bump(u)); }
+        break;
       case "brow": brow(0.7 * k, dur || 0.8); break;
-      case "frown": if (has("furrow")) pulse(ctl("furrow"), dur || 1.5, 0.6 * k, u => envelope(u * (dur || 1.5), dur || 1.5, 0.25, 0.5)); break;
+      case "frown": if (has("xFrown")) pulse(ctl("xFrown"), dur || 1.5, cfg.expr.frown * k, env(dur || 1.5, 0.25, 0.5)); else if (has("furrow")) pulse(ctl("furrow"), dur || 1.5, 0.6 * k, env(dur || 1.5, 0.25, 0.5)); break;
       case "thinks": gaze.override = { until: T + (dur || 1.3) }; setGaze(false, dur || 1.3, "think", thinkAway()); break;
       case "glance": gaze.override = { until: T + 0.55 }; setGaze(false, 0.55, "glance", { x: (rand() < 0.5 ? -1 : 1) * persona.aversionDeg * 1.3, y: rr(-2, 2) }); break;
       case "nod": nod(persona.nodDeg * k, { double: false }); break;
@@ -455,7 +471,9 @@ export function createEngine(o = {}) {
         if (!o.canShake || !o.canShake()) { nod(1.2 * k); break; }     // far side must be clean at the current yaw; else a small nod
         const dd = dur || 1.1; pulse("yaw", dd, 3 * k, u => Math.sin(2 * Math.PI * 2 * u) * bump(u)); break;
       }
-      case "wide": if (has("blink")) pulse(ctl("blink"), dur || 1, -0.22 * k, u => envelope(u * (dur || 1), dur || 1, 0.15, 0.4)); brow(0.5 * k, dur || 1); break;
+      case "wide":
+        if (has("xEyesWide")) { pulse(ctl("xEyesWide"), dur || 1, cfg.expr.wide * k, env(dur || 1, 0.15, 0.4)); brow(0.3 * k, dur || 1); break; }
+        if (has("blink")) pulse(ctl("blink"), dur || 1, -0.22 * k, u => envelope(u * (dur || 1), dur || 1, 0.15, 0.4)); brow(0.5 * k, dur || 1); break;
       case "wink": {
         const w = names.find(n => /^(wink|blink)(L|R|Left|Right)$/.test(n));
         if (w && o.canWink && o.canWink()) pulse(ctl(w), 0.4, 1, u => bump(u));
@@ -476,7 +494,10 @@ export function createEngine(o = {}) {
       user.onsets++; pendingNod = null; settled = false;
       // laughter-like bursts (3.6.3): three or more short voice onsets within 1.5 s -> she smiles with it
       user.bursts = (user.bursts || []).filter(x => T - x < 1.5); user.bursts.push(T);
-      if (user.bursts.length >= 3 && st.name !== "speaking" && refractory("laughSmile", 6)) { smile(0.4 * persona.expressiveness, 2.6, 0.35); emit("cue", { name: "laughsmile", t: T }); }
+      if (user.bursts.length >= 3 && st.name !== "speaking" && refractory("laughSmile", 6)) {
+        if (has("xSmileOpen")) openSmile(cfg.expr.laughSmile * persona.expressiveness, 2.6, 0.35); else smile(0.4 * persona.expressiveness, 2.6, 0.35);
+        emit("cue", { name: "laughsmile", t: T });
+      }
       if (st.auto && (st.name === "idle" || st.name === "yielding" || st.name === "thinking")) setState("listening");
       if (st.name === "idle" && idleQuiet > 15) notice();
       if (st.name === "speaking") { emit("bargein", { t: T }); if (cfg.autoYield) yieldTurn(); }
@@ -654,6 +675,10 @@ export function createEngine(o = {}) {
       ctlOut.blink = (ctlOut.blink || 0) + lid;
     }
     if (has("browUp")) ctlOut.browUp = (ctlOut.browUp || 0) + Math.max(0, mood.engagement - 0.6) * 0.3;
+    if (has("xSad") && mood.valence < 0) ctlOut.xSad = (ctlOut.xSad || 0) + Math.min(cfg.expr.sadMax, -mood.valence * cfg.expr.sadPerValence);   // a sad mood: inner brows up, corners down
+    if (has("xSmileOpen") && mood.valence >= cfg.expr.joyValence && st.name !== "speaking" && !user.voice && refractory("joy", cfg.expr.joyRefractoryS) && rand() < 0.5) {
+      openSmile(cfg.expr.joyOpen * persona.expressiveness, 2.2, 0.4); emit("cue", { name: "joy", t: T });   // joy: now and then an open smile between turns
+    }
     const bv = breath.out;
     if (has("breath")) ctlOut.breath = (ctlOut.breath || 0) + bv;
     else { zoom -= cfg.breath.standInZoom * bv; pitch += cfg.breath.standInPitchDeg * bv; }   // stand-in: the bust swells toward the camera a hair
@@ -674,7 +699,18 @@ export function createEngine(o = {}) {
       // smiling speech (3.1.8): a held smile spreads the lips: part of oo moves to ee
       const sm = (ctlOut.smile || 0) + (dw.smile || 0);
       if (sm > 0.15 && has("oo") && has("ee") && (dw.oo || 0) > 0) { const d = cfg.smileShare * clamp(sm, 0, 1) * dw.oo; ctlOut.oo = (ctlOut.oo || 0) - d; ctlOut.ee = (ctlOut.ee || 0) + 0.8 * d; }
+      // smiling speech with the trained corrective (xSmileAh: its still = ah 1 + smile 1): a share of the ah opening laughs, only while ah is open
+      if (has("xSmileAh") && sm > 0.2 && (dw.press || 0) < 0.05) ctlOut.xSmileAh = (ctlOut.xSmileAh || 0) + Math.min(cfg.expr.smileAhMax, cfg.expr.smileAh * ss((sm - 0.2) / 0.5) * (dw.ah || 0));
     }
+    // the open smile never fights the speech driver: gone on a closure, a fifth of it while she talks (the corrective above carries the laugh)
+    if (ctlOut.xSmileOpen) {
+      const closing = (dw.press || 0) > 0.02 || ((dw.mid || 0) > 0.02 && !["ah", "wide", "oo", "ee"].some(n => (dw[n] || 0) > 0.05));
+      ctlOut.xSmileOpen *= closing ? 0 : (vs || anySpeech ? 0.2 : 1);
+    }
+    // caps: trained expressions stay modest; the mouth ones together under openMax
+    const capX = { xBrowUp: cfg.expr.browMax, xFrown: cfg.expr.frownMax, xEyeSmile: cfg.expr.eyeSmileMax, xEyesWide: cfg.expr.wideMax, xSad: cfg.expr.sadMax, xSmileOpen: cfg.expr.openMax, xSmileAh: cfg.expr.smileAhMax };
+    for (const n of Object.keys(capX)) if (ctlOut[n] !== undefined) ctlOut[n] = clamp(ctlOut[n], 0, capX[n]);
+    if ((ctlOut.xSmileOpen || 0) + (ctlOut.xSmileAh || 0) > cfg.expr.openMax) { const f2 = cfg.expr.openMax / ((ctlOut.xSmileOpen || 0) + (ctlOut.xSmileAh || 0)); if (ctlOut.xSmileOpen) ctlOut.xSmileOpen *= f2; if (ctlOut.xSmileAh) ctlOut.xSmileAh *= f2; }
     // clamp every control to its range (current + delta)
     for (const n of Object.keys(ctlOut)) {
       if (!has(n)) { delete ctlOut[n]; continue; }
@@ -768,7 +804,7 @@ export function createBehaviour(viewer, o = {}) {
     stubPrev = { yaw: outp.yaw, pitch: outp.pitch, zoom: outp.zoom };
     const set = {}, rest = n => { const c = (viewer.controls || []).find(c2 => c2.name === n); return c ? c.rest || 0 : 0; };
     if (ctlList.includes("gazeX") && outp.gaze) { set.gazeX = rest("gazeX") + outp.gaze.x / 40; set.gazeY = rest("gazeY") + outp.gaze.y / 40; }
-    for (const n of ["browUp", "furrow", "breath"]) if (outp.controls[n] !== undefined) set[n] = outp.controls[n];
+    for (const n of ["browUp", "furrow", "breath", "xBrowUp", "xFrown", "xEyesWide", "xSad", "xEyeSmile"]) if (outp.controls[n] !== undefined) set[n] = outp.controls[n];
     try { if (Object.keys(set).length) { viewer.setControls(set); for (const k of Object.keys(set)) stubHeld.add(k); } } catch (e) { /* unknown control */ }
   }
   function tunePreset(on) {
