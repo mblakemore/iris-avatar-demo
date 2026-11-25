@@ -65,7 +65,9 @@ import { createBehaviour, parseTags, anchorCues } from "./openavatar-behaviour.j
 const $ = id => document.getElementById(id);
 const note = (t, ms = 6000) => { const n = $("note"); n.textContent = t; n.hidden = !t; clearTimeout(note.h); if (t && ms) note.h = setTimeout(() => { n.hidden = true; }, ms); };
 const fine = matchMedia("(pointer: fine)").matches;
-const LOOK = { ...OpenAvatarViewer.RENDER_PROFILES.portrait };
+// catchlights at about half the viewer's default brightness, with a smaller halo: a soft glint rather than a bright dot
+const CATCH = { halo: 0.12, lights: [{ az: -12, el: 14, size: 0.0006, intensity: 0.26, color: [1, 0.98, 0.95] }, { az: 16, el: -6, size: 0.00035, intensity: 0.07, color: [0.93, 0.96, 1] }] };
+const LOOK = { ...OpenAvatarViewer.RENDER_PROFILES.portrait, catchlights: CATCH };
 try {
   const v = await OpenAvatarViewer.create($("c"), {
     modelUrl: "iris.bin", pointer: false, background: "#14151a", limits: OpenAvatarViewer.FREE_HEAD,
