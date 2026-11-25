@@ -4,43 +4,42 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Iris — OpenAvatar demo</title>
-<meta name="description" content="A talking head-and-shoulders avatar rendered live in your browser. She breathes, blinks, looks at you and reacts; press play to hear her speak.">
+<meta name="description" content="A talking 3D Gaussian-splat avatar generated from a single portrait, rendered live in your browser. She breathes, blinks, looks at you and speaks.">
 <style>
-  :root { color-scheme: dark; --bg: #14151a; --fg: #ececf2; --mut: #9a9cab; --line: rgba(236,236,242,.22); --acc: #8fb0ff; --bar: rgba(26,27,34,.82); --rec: #ff5d5d; }
+  :root { color-scheme: dark; --bg: #14151a; --fg: #ececf2; --mut: #9a9cab; --line: rgba(236,236,242,.22); --acc: #8fb0ff; --bar: rgba(26,27,34,.82); }
   [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
   canvas:active { cursor: grabbing; }
-  header { position: fixed; left: 0; right: 0; top: 0; padding: calc(14px + env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) 0 max(16px, env(safe-area-inset-left, 0px)); pointer-events: none; }
+  header { position: fixed; left: 0; top: 0; max-width: min(340px, calc(100vw - 32px)); padding: calc(14px + env(safe-area-inset-top, 0px)) 0 0 max(16px, env(safe-area-inset-left, 0px)); pointer-events: none; }
   h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .01em; }
-  header p { margin: 2px 0 0; color: var(--mut); font-size: 13px; }
-  #state { display: inline-block; margin-top: 6px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--mut); font-size: 12px; }
-  #bar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(18px + env(safe-area-inset-bottom, 0px)); display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; align-items: center; padding: 8px; background: var(--bar); border: 1px solid var(--line); border-radius: 24px; backdrop-filter: blur(8px); width: max-content; max-width: calc(100vw - 32px); box-sizing: border-box; }
-  button { font: inherit; color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 9px 16px; cursor: pointer; white-space: nowrap; }
+  .lead { margin: 4px 0 0; font-size: 13.5px; color: var(--fg); }
+  .tech { margin: 3px 0 0; font-size: 12.5px; line-height: 1.45; color: var(--mut); }
+  .hint { margin: 8px 0 0; font-size: 12.5px; color: var(--mut); }
+  #state { display: inline-block; margin-top: 8px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--mut); font-size: 12px; }
+  #bar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(18px + env(safe-area-inset-bottom, 0px)); display: flex; gap: 8px; align-items: center; padding: 8px; background: var(--bar); border: 1px solid var(--line); border-radius: 999px; backdrop-filter: blur(8px); max-width: calc(100vw - 32px); box-sizing: border-box; }
+  button { font: inherit; color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 9px 18px; cursor: pointer; white-space: nowrap; }
   button:hover, button:focus-visible { border-color: var(--acc); outline: none; }
-  button[aria-pressed="true"] { border-color: var(--acc); color: var(--acc); }
   #play { background: var(--acc); border-color: var(--acc); color: #10131c; font-weight: 600; }
   #msg { position: fixed; inset: 0; display: grid; place-items: center; color: var(--mut); pointer-events: none; text-align: center; padding: 0 24px; }
-  #note { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(88px + env(safe-area-inset-bottom, 0px)); color: var(--mut); font-size: 12.5px; text-align: center; max-width: calc(100vw - 32px); pointer-events: none; }
-  #camInd { position: fixed; right: max(16px, env(safe-area-inset-right, 0px)); top: calc(40px + env(safe-area-inset-top, 0px)); display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--mut); }
-  #camInd::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--rec); }
-  @media (max-width: 560px) { #info { display: none; } #bar { border-radius: 20px; } button { padding: 8px 12px; } #note { bottom: calc(132px + env(safe-area-inset-bottom, 0px)); } }
+  #note { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(80px + env(safe-area-inset-bottom, 0px)); color: var(--mut); font-size: 12.5px; text-align: center; max-width: calc(100vw - 32px); pointer-events: none; }
   #info { position: fixed; right: max(16px, env(safe-area-inset-right, 0px)); top: calc(16px + env(safe-area-inset-top, 0px)); color: var(--mut); font-size: 12px; pointer-events: none; font-variant-numeric: tabular-nums; }
+  @media (max-width: 560px) { #info { display: none; } .tech { font-size: 12px; } }
 </style>
 </head>
 <body>
 <canvas id="c" aria-label="Iris, a 3D avatar. Drag to turn her head."></canvas>
-<header><h1>Iris</h1><p>Drag to turn her head · scroll or pinch to zoom</p><span id="state" hidden></span></header>
+<header>
+  <h1>Iris</h1>
+  <p class="lead">Generated from a single portrait.</p>
+  <p class="tech">A 3D Gaussian-splat head and shoulders (about 124,000 Gaussians) with a learned rig of mouth, eye, brow and breathing controls, driven by the speech's timings and rendered in real time in your browser with WebGL 2. No video and no server.</p>
+  <p class="hint">Drag to turn her head · scroll or pinch to zoom</p>
+  <span id="state" hidden></span>
+</header>
 <div id="info"></div>
-<div id="camInd" hidden>camera on (this device only)</div>
 <div id="msg">Loading…</div>
 <div id="note" hidden></div>
-<div id="bar" hidden>
-  <button id="play">Hear her speak</button>
-  <button id="talk" aria-pressed="false" hidden>Talk to her</button>
-  <button id="see" aria-pressed="false" hidden>Let her see you</button>
-  <button id="reset">Reset view</button>
-</div>
+<div id="bar" hidden><button id="play">Hear her speak</button><button id="reset">Reset view</button></div>
 <audio id="aud" src="sample.mp3" preload="auto"></audio>
 <script type="module">
 import { OpenAvatarViewer } from "./openavatar-viewer.js";
@@ -49,7 +48,7 @@ const $ = id => document.getElementById(id);
 const note = (t, ms = 6000) => { const n = $("note"); n.textContent = t; n.hidden = !t; clearTimeout(note.h); if (t && ms) note.h = setTimeout(() => { n.hidden = true; }, ms); };
 try {
   const v = await OpenAvatarViewer.create($("c"), {
-    modelUrl: "iris.bin", pointer: true, background: "#14151a", limits: OpenAvatarViewer.FREE_HEAD,
+    modelUrl: "iris.bin", pointer: false, background: "#14151a", limits: OpenAvatarViewer.FREE_HEAD,
     on: { progress: f => { $("msg").textContent = "Loading " + Math.round(f * 100) + "%"; },
           frame: s => { $("info").textContent = `${s.n.toLocaleString()} Gaussians · ${s.fps.toFixed(0)} fps`; } }
   });
@@ -64,12 +63,12 @@ try {
   if (timings) { v.attachAudio(a, { driver: "timed" }); v.setDriver("timed", { timings }); v.setTrack({ timings }); }
   else v.attachAudio(a, { driver: "loudness" });
 
-  // life: breathing, blinks, gaze, listening / thinking / speaking states, head motion from her voice's pitch, expression cues
+  // life: breathing, blinks, gaze, thinking / speaking states, head motion from her voice's pitch, expression cues
   const b = createBehaviour(v, { persona: { seed: 1 } });
   let visits = 1; try { visits = (+localStorage.getItem("iris.visits") || 0) + 1; localStorage.setItem("iris.visits", String(visits)); } catch {}
   b.remember({ visits });
   b.setMood({ valence: 0.25, arousal: 0.45, engagement: 0.7 });
-  const NAMES = { idle: "idle", listening: "listening", thinking: "thinking", speaking: "speaking", yielding: "your turn" };
+  const NAMES = { idle: "idle", listening: "idle", thinking: "thinking", speaking: "speaking", yielding: "your turn" };
   b.on("state", e => { const s = e && e.state; $("state").hidden = false; $("state").textContent = NAMES[s] || s; });
   // expression cues written into the line, as an LLM would ([smile], [brow], ...): stripped from the text, timed on its words
   const TAGGED = "Hello, [smile] I'm Iris. Drag to turn my head, scroll to zoom, and click the button [brow] whenever you'd like to hear me speak.";
@@ -98,70 +97,51 @@ try {
   a.addEventListener("play", label); a.addEventListener("pause", label); a.addEventListener("ended", label);
   $("play").onclick = toggle;
 
-  // her head drifts back to the centre a few seconds after you let go (her own small movements carry on on top)
-  const base = { yaw: 0, pitch: 0, roll: 0 }; let lastTouch = 0, easing = false, down = null, ptrDown = false;
-  const setPose0 = v.setPose.bind(v);
-  v.setPose = p => { for (const k of ["yaw", "pitch", "roll"]) if (p[k] !== undefined) base[k] = +p[k]; if (!easing) lastTouch = performance.now(); return setPose0(p); };
+  // drag to turn her head (drag up = she looks up), wheel / pinch to zoom
+  const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
+  const base = { yaw: 0, pitch: 0, zoom: 1 }; let lastTouch = 0;
+  const pose = (p, user = true) => { Object.assign(base, p); if (user) lastTouch = performance.now(); v.setPose(p); };
+  const c = $("c"), ptr = new Map(); let pinch = 0, down = null;
+  c.addEventListener("pointerdown", e => {
+    c.setPointerCapture(e.pointerId); ptr.set(e.pointerId, [e.clientX, e.clientY]);
+    if (ptr.size === 2) { const [p, q] = [...ptr.values()]; pinch = Math.hypot(p[0] - q[0], p[1] - q[1]); }
+    down = ptr.size === 1 ? { x: e.clientX, y: e.clientY, t: performance.now() } : null;
+  });
+  c.addEventListener("pointermove", e => {
+    if (!ptr.has(e.pointerId)) {                           // hovering: she glances at the pointer when it comes near her face
+      if (e.pointerType !== "mouse") return;
+      const r = c.getBoundingClientRect(), x = (e.clientX - (r.left + r.width / 2)) / r.width, y = (e.clientY - (r.top + r.height * 0.4)) / r.height;
+      if (Math.abs(x) < 0.6 && Math.abs(y) < 0.6 && Math.hypot(x, y) > 0.15) b.glanceAt(x * 30, -y * 24);
+      return;
+    }
+    const p = ptr.get(e.pointerId), dx = e.clientX - p[0], dy = e.clientY - p[1]; ptr.set(e.pointerId, [e.clientX, e.clientY]);
+    if (ptr.size === 1) pose({ yaw: base.yaw - dx * 0.006, pitch: clamp(base.pitch - dy * 0.004, -1, 1) });
+    else if (ptr.size === 2) { const [m, n] = [...ptr.values()], d = Math.hypot(m[0] - n[0], m[1] - n[1]); if (pinch) pose({ zoom: clamp(base.zoom * pinch / d, 0.25, 2.5) }); pinch = d; }
+  });
+  const up = e => {
+    if (down && ptr.size === 1 && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6 && performance.now() - down.t < 400) toggle();   // a click on her plays the line
+    ptr.delete(e.pointerId); pinch = 0; down = null;
+  };
+  c.addEventListener("pointerup", up); c.addEventListener("pointercancel", e => { ptr.delete(e.pointerId); pinch = 0; down = null; });
+  c.addEventListener("wheel", e => { e.preventDefault(); pose({ zoom: clamp(base.zoom * Math.exp(e.deltaY * 0.001), 0.25, 2.5) }); }, { passive: false });
+
+  // her head drifts back to face you a few seconds after you let go (her own small movements carry on on top)
   const RETURN_AFTER = 4000, RETURN_TIME = 1600;
   let from = null, t0 = 0;
   (function tick() {
-    const now = performance.now(), off = Math.abs(base.yaw) + Math.abs(base.pitch) + Math.abs(base.roll);
+    const now = performance.now(), off = Math.abs(base.yaw) + Math.abs(base.pitch);
     if (from) {
       const u = Math.min(1, (now - t0) / RETURN_TIME), k = 1 - u * u * (3 - 2 * u);
-      easing = true; v.setPose({ yaw: from.yaw * k, pitch: from.pitch * k, roll: from.roll * k }); easing = false;
-      if (u >= 1 || lastTouch > t0) from = null;
-    } else if (off > 1e-4 && now - lastTouch > RETURN_AFTER && !ptrDown) { from = { ...base }; t0 = now; }
+      pose({ yaw: from.yaw * k, pitch: from.pitch * k }, false);
+      if (u >= 1 || lastTouch > t0 || ptr.size) from = null;
+    } else if (off > 1e-4 && now - lastTouch > RETURN_AFTER && !ptr.size) { from = { yaw: base.yaw, pitch: base.pitch }; t0 = now; }
     requestAnimationFrame(tick);
   })();
-  $("reset").onclick = () => v.setPose({ yaw: 0, pitch: 0, roll: 0, zoom: 1 });
+  $("reset").onclick = () => { from = null; pose({ yaw: 0, pitch: 0, zoom: 1 }); };
 
-  // a click on her (a press that did not turn into a drag) also plays the line; she glances at the pointer near her face
-  $("c").addEventListener("pointerdown", e => { ptrDown = true; down = { x: e.clientX, y: e.clientY, t: performance.now() }; });
-  addEventListener("pointerup", () => { ptrDown = false; });
-  addEventListener("pointercancel", () => { ptrDown = false; });
-  $("c").addEventListener("pointerup", e => {
-    if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6 && performance.now() - down.t < 400) toggle();
-    down = null;
-  });
-  $("c").addEventListener("pointermove", e => {
-    if (e.buttons || e.pointerType !== "mouse") return;
-    const r = $("c").getBoundingClientRect(), x = (e.clientX - (r.left + r.width / 2)) / r.width, y = (e.clientY - (r.top + r.height * 0.4)) / r.height;
-    if (Math.abs(x) < 0.6 && Math.abs(y) < 0.6 && Math.hypot(x, y) > 0.15) b.glanceAt(x * 30, -y * 24);
-  });
   let hiddenAt = 0;
   document.addEventListener("visibilitychange", () => { if (document.hidden) hiddenAt = performance.now(); else if (hiddenAt && performance.now() - hiddenAt > 5000) b.noticeUser(); });
   addEventListener("keydown", e => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); toggle(); } });
-
-  // optional: she listens while you talk (microphone level only, analysed here, nothing recorded or sent)
-  const media = window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
-  let listen = null;
-  if (media) $("talk").hidden = false;
-  $("talk").onclick = async () => {
-    if (listen) { listen.stop(); listen = null; b.attachListener(null); $("talk").setAttribute("aria-pressed", "false"); $("talk").textContent = "Talk to her"; note(""); return; }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-      const L = await import("./openavatar-listen.js"); const lis = L.createListener(stream, { vad: false, turn: false }); await lis.start();
-      listen = { stop: () => { try { lis.stop(); } catch {} stream.getTracks().forEach(t => t.stop()); } };
-      b.attachListener(lis); $("talk").setAttribute("aria-pressed", "true"); $("talk").textContent = "Stop talking";
-      note("She's listening: talk to her and pause now and then. Only the loudness of your voice is used, in this browser. She doesn't answer yet.", 9000);
-    } catch (e) { note("Microphone not available: " + e.message); }
-  };
-
-  // optional: she looks at you (camera analysed in this browser with MediaPipe; no image is kept or sent)
-  let cam = null;
-  if (media) $("see").hidden = false;
-  $("see").onclick = async () => {
-    if (cam) { cam.stop(); cam = null; b.attachAttention(null); $("camInd").hidden = true; $("see").setAttribute("aria-pressed", "false"); $("see").textContent = "Let her see you"; return; }
-    if (!confirm("Let her see you? Your camera image is analysed only in this browser (where your face is, whether you smile) so she can look at you. Nothing is recorded or sent anywhere.")) return;
-    note("Starting the camera…", 0);
-    try {
-      const A = await import("./openavatar-attention.js"), u = p => new URL(p, location.href).href;
-      const att = A.createAttention({ fps: 10, visionUrl: u("vendor/mediapipe/vision_bundle.mjs"), wasmBase: u("vendor/mediapipe/wasm"), modelUrl: u("vendor/mediapipe/face_landmarker.task") });
-      await att.start();
-      cam = att; b.attachAttention(att); $("camInd").hidden = false; $("see").setAttribute("aria-pressed", "true"); $("see").textContent = "Camera off";
-      note("She can see you now: move around, smile, look away.", 6000);
-    } catch (e) { note("Camera not available: " + e.message); }
-  };
 } catch (e) { $("msg").textContent = "Could not start: " + e.message; }
 </script>
 </body>
