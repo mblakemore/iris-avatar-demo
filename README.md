@@ -1,5 +1,7 @@
 # Iris — OpenAvatar demo
 
+**Live demo: https://mblakemore.github.io/iris-avatar-demo/**
+
 A talking head-and-shoulders avatar generated from a single portrait: a 3D Gaussian-splat model (about 124,000 Gaussians) with a learned rig of mouth shapes, eyes, brows, breathing and seven trained facial expressions (brow raise, frown, eye smile, open smile, wide eyes, sad, smiling speech), rendered live in the browser with WebGL 2 (no libraries, no video, no server).
 
 - Drag to turn her head (drag up and she looks up); scroll or pinch to zoom. A few seconds after you let go, she turns back to face you.

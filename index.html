@@ -33,8 +33,10 @@
   #play { background: var(--acc); border-color: var(--acc); color: #10131c; font-weight: 600; }
   #msg { position: fixed; inset: 0; display: grid; place-items: center; color: var(--mut); pointer-events: none; text-align: center; padding: 0 24px; }
   #note { font-size: 12.5px; color: var(--mut); text-align: center; pointer-events: none; }
-  #info { position: fixed; right: max(16px, env(safe-area-inset-right, 0px)); top: calc(16px + env(safe-area-inset-top, 0px)); color: var(--mut); font-size: 12px; pointer-events: none; font-variant-numeric: tabular-nums; text-align: right; }
-  @media (max-width: 560px) { #info, .tech, .hint, #state { display: none !important; } #cap { font-size: 14px; min-height: 0; } #cap em { display: none; } .lbl { display: none; } button.chip { padding: 4px 9px; font-size: 12.5px; } #bar { gap: 6px; } button { padding: 7px 14px; } }
+  #info { position: fixed; right: max(16px, env(safe-area-inset-right, 0px)); top: calc(16px + env(safe-area-inset-top, 0px)); color: var(--mut); font-size: 12px; line-height: 1.6; pointer-events: none; font-variant-numeric: tabular-nums; text-align: right; }
+  #info a { color: var(--mut); text-decoration: none; pointer-events: auto; }
+  #info a:hover, #info a:focus-visible { color: var(--acc); text-decoration: underline; }
+  @media (max-width: 560px) { header { max-width: calc(100vw - 200px); } #stats, .tech, .hint, #state { display: none !important; } #cap { font-size: 14px; min-height: 0; } #cap em { display: none; } .lbl { display: none; } button.chip { padding: 4px 9px; font-size: 12.5px; } #bar { gap: 6px; } button { padding: 7px 14px; } }
   @media (max-height: 620px) { .tech { display: none; } }
 </style>
 </head>
@@ -47,7 +49,7 @@
   <p class="hint">Drag to turn her head · scroll or pinch to zoom</p>
   <span id="state" hidden></span>
 </header>
-<div id="info"></div>
+<div id="info"><div id="stats"></div><div>Iris model v23d</div><a href="https://github.com/mblakemore" target="_blank" rel="noopener">github.com/mblakemore</a></div>
 <div id="msg">Loading…</div>
 <div id="dock" hidden>
   <div id="cap" aria-live="off" hidden></div>
@@ -68,7 +70,7 @@ try {
     modelUrl: "iris.bin", pointer: false, background: "#14151a", limits: OpenAvatarViewer.FREE_HEAD,
     render: fine ? OpenAvatarViewer.RENDER_PROFILES.desktop : {},
     on: { progress: f => { $("msg").textContent = "Loading " + Math.round(f * 100) + "%"; },
-          frame: s => { $("info").textContent = `${s.n.toLocaleString()} Gaussians · ${s.fps.toFixed(0)} fps`; } }
+          frame: s => { $("stats").textContent = `${s.n.toLocaleString()} Gaussians · ${s.fps.toFixed(0)} fps`; } }
   });
   $("msg").hidden = true; $("dock").hidden = false;
   const a = $("aud");
