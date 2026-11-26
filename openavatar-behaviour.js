@@ -59,6 +59,22 @@ export function makeFollower(amax, tau = 0.05) {
     get value() { return x; }, get velocity() { return v; }, reset(x0 = 0) { x = x0; v = 0; }
   };
 }
+// (spikes/lf_micro) a smooth follower: the target through a first-order pre-lag (preS), then a critically damped spring (time constant T, stepped
+// exactly for any dt): a step in the target gives a bell-shaped speed with no acceleration step at its start; amax (deg/s^2) still bounds it.
+export function makeSmoothFollower(amax, T = 0.06, preS = 0.03) {
+  let x = 0, v = 0, y1 = null;
+  return {
+    step(y, dt) {
+      if (!(dt > 0)) return x;
+      if (y1 === null) y1 = x;
+      y1 += (y - y1) * (1 - Math.exp(-dt / Math.max(1e-4, preS)));
+      const w = 1 / T, e = x - y1, ex = Math.exp(-w * dt), v2 = (v - w * (v + w * e) * dt) * ex;
+      const a = clamp((v2 - v) / dt, -amax, amax); v += a * dt; x += v * dt;   // semi-implicit: the per-frame velocity change is exactly a * dt (the bound)
+      return x;
+    },
+    get value() { return x; }, get velocity() { return v; }, reset(x0 = 0) { x = x0; v = 0; y1 = null; }
+  };
+}
 
 // ------------------------------------------------------------------ pitch (F0): McLeod normalised square difference, own code
 // x: a frame of samples (any length >= 2 periods of fmin), sr: its rate. Returns { f0 (Hz, 0 = none), clarity (0..1) }.
@@ -167,13 +183,17 @@ export function analyseClip(pcm, sr, opts = {}) {
 }
 
 // ------------------------------------------------------------------ LLM expression tags (section 3.6.2)
-export const TAGS = ["smile", "thinks", "brow", "frown", "glance", "nod", "shake", "grin", "wide", "wink", "laugh"];
+export const LEGACY_TAGS = ["smile", "thinks", "brow", "frown", "glance", "nod", "shake", "grin", "wide", "wink", "laugh"];
+// composites (spikes/lf_micro): warm = eye smile + smile + a hint of brow; curious = brow + eyes a touch wide + a small tilt; concern = inner brows up
+// + a little frown; surprise = wide eyes + brows + lips part; sad = sadness for a phrase; hmm = a thinking glance + lips pressed + a faint frown
+export const TAGS = [...LEGACY_TAGS, "warm", "curious", "concern", "surprise", "sad", "hmm"];
 // "That's a good question. [thinks] I'd start with... [smile] the boring answer." -> { text (what goes to TTS), tags: [{ name, index }] }
-// index = position in the CLEAN text the tag stood before. Unknown [words] are left in the text.
-export function parseTags(text) {
+// index = position in the CLEAN text the tag stood before. Unknown [words] are left in the text. opts.tags: the vocabulary (LEGACY_TAGS = before 2026-11-26).
+export function parseTags(text, opts = {}) {
+  const vocab = Array.isArray(opts.tags) ? opts.tags : TAGS;
   const tags = []; let out = "", i = 0; const s = String(text || ""), re = /\[([a-zA-Z]+)\]/g; let m;
   while ((m = re.exec(s))) {
-    const name = m[1].toLowerCase(); if (!TAGS.includes(name)) continue;
+    const name = m[1].toLowerCase(); if (!vocab.includes(name)) continue;
     out += s.slice(i, m.index); i = m.index + m[0].length;
     if (out.endsWith(" ") && s[i] === " ") i++;                    // "a [smile] b" -> "a b"
     tags.push({ name, index: out.length });
@@ -198,6 +218,44 @@ export function anchorCues(tags, timings) {
     out.push({ name: tg.name, t, wordEnd, phraseEnd, index: tg.index });
   }
   return out;
+}
+
+// ------------------------------------------------------------------ word-level micro-expression cues (spikes/lf_micro)
+// Small English word lists: a fleeting eye smile on positive words, a flicker of concern on negative ones, a brow flash on the last word of a
+// question, a lip press before an answer that opens with a hedge. Content words only; an LLM tag on the same word wins (tags are stronger).
+export const MICRO_WORDS = {
+  pos: ["good", "great", "glad", "happy", "love", "lovely", "nice", "wonderful", "fantastic", "amazing", "awesome", "excellent", "perfect", "fun", "funny",
+        "thanks", "thank", "welcome", "enjoy", "enjoyed", "beautiful", "brilliant", "delighted", "pleased", "congratulations", "exciting", "excited", "worked", "yay", "cool"],
+  neg: ["sorry", "unfortunately", "sadly", "afraid", "problem", "problems", "failed", "fail", "fails", "broken", "worry", "worried", "difficult", "hard", "wrong",
+        "bad", "error", "errors", "lost", "miss", "missed", "timeout", "crash", "crashed", "trouble", "pain", "sad", "tough", "issue", "issues"],
+  hedge: ["well", "hmm", "um", "uh", "honestly", "actually", "maybe", "perhaps", "so", "look", "okay", "ok"]
+};
+// words of character timings: [{ text, lower, start, end, i0, i1, sentEnd: "." | "?" | "!" | null (punctuation right after the word) }]
+export function timingWords(timings) {
+  const T = Array.isArray(timings) ? timings : [], out = []; let i = 0;
+  const isL = c => /[\p{L}\p{N}']/u.test((c && c.char) || "");
+  while (i < T.length) {
+    if (!isL(T[i])) { i++; continue; }
+    let j = i; while (j < T.length && isL(T[j])) j++;
+    const text = T.slice(i, j).map(c => c.char).join(""); let k = j; while (k < T.length && /\s/.test(T[k].char || "")) k++;
+    const p = k < T.length && /[.?!,;:]/.test(T[k].char || "") ? T[k].char : (j < T.length && /[.?!,;:]/.test(T[j].char || "") ? T[j].char : null);
+    out.push({ text, lower: text.toLowerCase().replace(/'s$/, ""), start: T[i].start, end: T[j - 1].end, i0: i, i1: j, sentEnd: p });
+    i = j;
+  }
+  return out;
+}
+// -> [{ t, kind: "pos" | "neg" | "question" , word }] plus { hedge: first-word start or null }
+export function microWordCues(timings, lists = MICRO_WORDS) {
+  const W = timingWords(timings), ev = []; if (!W.length) return { ev, hedge: null, start: null };
+  const P = new Set(lists.pos), N = new Set(lists.neg);
+  for (let k = 0; k < W.length; k++) {
+    const w = W[k];
+    if (P.has(w.lower)) ev.push({ t: w.start, kind: "pos", word: w.text });
+    else if (N.has(w.lower)) ev.push({ t: w.start, kind: "neg", word: w.text });
+    if (w.sentEnd === "?") ev.push({ t: w.start, kind: "question", word: w.text });
+  }
+  const f = W[0].lower, hedge = lists.hedge.includes(f) && (W[0].sentEnd === "," || ["hmm", "um", "uh"].includes(f)) ? W[0].start : null;   // "Well, ..." yes, "Well done" no
+  return { ev: ev.sort((a, b) => a.t - b.t), hedge, start: W[0].start };
 }
 
 // ------------------------------------------------------------------ persona (section 3.6.1): a seed plus a dozen numbers
@@ -278,13 +336,40 @@ export const DEFAULT_BEHAVIOUR = {
   // trained expression controls (spikes/lf_train x*, models v23+; spikes/lf_expr): used when the model has them, else the synthetic / stand-in ones.
   // Weight 1 = the generated still's full expression (strong), so the cues stay well below it; caps hold every sum.
   expr: { brow: 0.6, browMax: 0.6, frown: 0.5, frownMax: 0.6, eyeSmile: 0.35, eyeSmileMax: 0.5, grin: 0.5, laugh: 0.6, openMax: 0.65, wide: 0.5, wideMax: 0.6,
-          sadPerValence: 0.35, sadMax: 0.3, smileAh: 0.5, smileAhMax: 0.4, laughSmile: 0.3, joyValence: 0.6, joyOpen: 0.25, joyRefractoryS: 12 }
+          sadPerValence: 0.35, sadMax: 0.3, smileAh: 0.5, smileAhMax: 0.4, laughSmile: 0.3, joyValence: 0.6, joyOpen: 0.25, joyRefractoryS: 12,
+          tinyOpenMax: 0.3, tinySmileAhMax: 0.2, tinyMaxGaussians: 12000 },   // (micro) the tiny tier's open smile is poor (INTEGRATION): capped there
+  // MICRO (spikes/lf_micro): small, short, content-timed movements on top of the states. { enabled: false } = the behaviour before 2026-11-26 exactly
+  // (same random stream, same output frame for frame); every part has its own switch. Uses its own random stream, so the conversation schedule
+  // (gaze, nods, beats) stays the same with it on.
+  micro: {
+    enabled: true,
+    blinkPerMin: { idle: 16, listening: 15, thinking: 24, speaking: 24, yielding: 18 }, attentiveBlink: 0.8,   // fewer while the user talks, more while thinking
+    gazeBlink: { enabled: true, minDeg: 7, chance: [[7, 0.2], [12, 0.45], [20, 0.8], [30, 0.95]] },        // blink with a gaze shift (Evinger: likelier the larger)
+    lid: { enabled: true, downPerDeg: 0.014, upPerDeg: 0.006, max: 0.12, min: -0.06, totalMax: 0.2, tauS: 0.07 },   // totalMax: the whole held lid (mood + settle + follow); above ~.25 the two lids droop unevenly (sheets/stills1)          // the upper lid follows the eyes' pitch
+    drift: { enabled: true, deg: 0.22, hz: 0.35 },                                                          // slow fixational drift (the viewer does microsaccades)
+    thinkSearch: { enabled: true, stepDeg: [1.2, 3.2], everyS: [0.45, 1.1] },                               // the eyes keep moving a little while thinking
+    words: { enabled: true, refractoryS: 1.6, leadS: 0.06, pos: 0.2, neg: 0.14, question: 0.3 },           // fleeting eye smile / concern / brow on words
+    hedgePress: { enabled: true, amount: 0.32, durS: 0.38, gapS: 0.18 },                                    // lips press before a hesitant answer
+    afterglow: { enabled: true, eyeSmile: 0.14, smile: 0.07, durS: 3.5 },                                   // a smile lingers after a laugh / grin
+    swallow: { enabled: true, everyS: [40, 110], pitchDeg: 0.7, press: 0.22 },
+    lipPart: { enabled: true, everyS: [20, 60], holdS: [3, 8], amount: [0.05, 0.09] },                      // idle: lips part a little now and then
+    shift: { enabled: true, everyS: [22, 55], yawDeg: 1.6, rollDeg: [-0.5, 1.5], pitchDeg: 0.6 }            // idle: posture settles somewhere new
+  },
+  // IDLE DIRECTOR (spikes/lf_micro): a varied idle repertoire (off by default; the demo page turns it on with b.setDirector(true))
+  director: {
+    enabled: false, medianS: 4.2, sigma: 0.5, minS: 1.6, maxS: 14, activityHz: 0.012,
+    weights: { glance: 3, place: 3, read: 1.2, smile: 1.4, brow: 0.8, thinks: 1, shift: 1, swallow: 0.5, lips: 0.6, sigh: 0.5, nod: 0.5,
+               checkin: 1.6, longblink: 0.6, signature: 0.25, wide: 0.3, quiet: 2.2 },
+    cooldownS: { glance: 4, place: 8, read: 25, smile: 14, brow: 10, thinks: 15, shift: 20, swallow: 45, lips: 30, sigh: 40, nod: 18, checkin: 10,
+                 longblink: 15, signature: 90, wide: 45, quiet: 0 }
+  }
 };
 
 // ------------------------------------------------------------------ the engine: pure, stepped once per frame (tests drive it directly)
 // o.controls: the model's control names; o.ranges: {name: [min, max]}; o.random; o.persona; o.clock: () => clip time of the playing reply (s)
 export function createEngine(o = {}) {
   const cfg = mergeDeep(DEFAULT_BEHAVIOUR, o.config || {});
+  if (o.legacy) cfg.micro = { ...cfg.micro, enabled: false };      // the behaviour before 2026-11-26 (spikes/lf_micro), frame for frame
   const persona = o.persona && o.persona.thinkDir ? { ...DEFAULT_PERSONA, ...o.persona } : makePersona((o.persona && o.persona.seed) || o.seed || 1, o.persona || {});
   const rand = o.random || seededRandom((persona.seed || 1) * 31 + 5), rr = (a, b) => a + (b - a) * rand(), rrA = a => rr(a[0], a[1]);
   const names = (o.controls || []).slice(), has = n => names.includes(n), ranges = o.ranges || {};
@@ -300,12 +385,28 @@ export function createEngine(o = {}) {
   const hist = { avSide: [] };
   const gaze = { onUser: true, x: 0, y: 0, until: 0, kind: "user", override: null, lockOn: false };
   let inStep = false, pendingBlink = false, yieldHold = false, headF0 = 0, blinkNow = false, wasSpeaking = false, notSpeakingFor = 0, speakingFor = 0, idleQuiet = 0, settle = 0, lipPart = 0, browHold = 0, tilt = 0, tiltTarget = 0, lean = 0, leanTarget = 0, settled = false;
-  const fol = { yaw: makeFollower(cfg.headAccel), pitch: makeFollower(cfg.headAccel), roll: makeFollower(cfg.headAccel * 0.6) };
+  // (micro, MOTION request 3) exact exponential lags instead of first-order Euler (frame-rate independent); legacy keeps min(1, dt / tau)
+  const lagK = (dt, tau) => ((cfg.micro || {}).enabled === true ? 1 - Math.exp(-dt / Math.max(1e-4, tau)) : Math.min(1, dt / tau));
+  // (micro, MOTION request 2) head followers: a pre-lag + critically damped spring (bell-shaped speed, no bang-bang plateau), still bounded by headAccel
+  const mkF = a => { const M_ = cfg.micro || {}; return M_.enabled === true && (M_.head || {}).smooth !== false ? makeSmoothFollower(a, (M_.head || {}).T ?? 0.06, (M_.head || {}).preS ?? 0.03) : makeFollower(a); };
+  const fol = { yaw: mkF(cfg.headAccel), pitch: mkF(cfg.headAccel), roll: mkF(cfg.headAccel * 0.6) };
   const noise = { yaw: makeNoise(rand, [{ hz: 0.06, amp: 1.6 }, { hz: 0.15, amp: 0.7 }, { hz: 0.37, amp: 0.2 }]), pitch: makeNoise(rand, [{ hz: 0.07, amp: 0.6 }, { hz: 0.19, amp: 0.3 }, { hz: 0.43, amp: 0.1 }]),
                   roll: makeNoise(rand, [{ hz: 0.05, amp: 0.5 }, { hz: 0.13, amp: 0.25 }]) };
   const breath = { v: 0.3, o1: 0.3, out: 0.3, phase: rand(), period: rrA(cfg.breath.periodS), inhale: null, deep: 0 };
   let blinkRateState = null;
   const memo = { visits: 0, greeted: false };
+  // ---- micro (spikes/lf_micro): its own random stream (the core schedule above is unchanged by it)
+  const MC = cfg.micro || {}, MON = MC.enabled === true, mon = k => MON && MC[k] && MC[k].enabled !== false;
+  const mrand = o.microRandom || seededRandom((persona.seed || 1) * 977 + 211), mr = (a, b) => a + (b - a) * mrand(), mrA = a => mr(a[0], a[1]);
+  const mic = { lid: 0, thinkOff: { x: 0, y: 0 }, thinkNext: 0, drift: MON ? { x: makeNoise(mrand, [{ hz: (MC.drift || {}).hz || 0.35, amp: 1 }, { hz: 1.1 * ((MC.drift || {}).hz || 0.35), amp: 0.4 }]),
+                y: makeNoise(mrand, [{ hz: (MC.drift || {}).hz || 0.35, amp: 1 }, { hz: 1.3 * ((MC.drift || {}).hz || 0.35), amp: 0.4 }]) } : null,
+                lastTarget: { x: 0, y: 0 }, swallowAt: MON ? T + mrA((MC.swallow || {}).everyS || [40, 110]) : 1e9, lipAt: MON ? T + mrA((MC.lipPart || {}).everyS || [20, 60]) : 1e9,
+                lipUntil: -1, lipAmt: 0, lip: 0, shiftAt: MON ? T + mrA((MC.shift || {}).everyS || [22, 55]) : 1e9, shiftT: { yaw: 0, pitch: 0, roll: 0 }, shift: { yaw: 0, pitch: 0, roll: 0 },
+                lastWordCue: -99, spk: 0, og: 1 };
+  const tier = o.tier || null;
+  // the director (off unless setDirector): see DEFAULT_BEHAVIOUR.director
+  const DIR = { on: !!(cfg.director && cfg.director.enabled), cfg: cfg.director || {}, next: 0, pauseUntil: -1, last: {}, prev: null, log: [], act: null,
+                places: null, rand: null };
 
   function on(ev, fn) { (handlers[ev] || (handlers[ev] = [])).push(fn); return () => { const a = handlers[ev], i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); }; }
   function rollRoom(side) { const L = o.limits ? o.limits() : null; if (!L || !L.roll) return 6; return Math.max(0, (side > 0 ? L.roll[1] : -L.roll[0]) / DEG); }   // degrees the viewer allows that way
@@ -350,7 +451,9 @@ export function createEngine(o = {}) {
   function applyBlinkRate() {
     while (evBlinks.length && T - evBlinks[0] > 20) evBlinks.shift();
     const evRate = Math.round(evBlinks.length * 60 / Math.max(10, Math.min(20, T)) / 2) * 2;   // whole steps: the viewer's preset is re-set only on a change
-    const per = Math.max(6, (cfg.blinkPerMin[st.name] || 17) - evRate), k = persona.blinkScale * (0.85 + 0.35 * mood.arousal), mean = 60 / (per * k);
+    let base = cfg.blinkPerMin[st.name] || 17;
+    if (MON && MC.blinkPerMin) { base = MC.blinkPerMin[st.name] || base; if (st.name === "listening" && user.voice) base *= MC.attentiveBlink ?? 1; }   // attentive listening: fewer
+    const per = Math.max(6, base - evRate), k = persona.blinkScale * (0.85 + 0.35 * mood.arousal), mean = 60 / (per * k);
     const iv = [+(mean * 0.65).toFixed(2), +(mean * 1.35).toFixed(2)];
     if (!blinkRateState || blinkRateState[0] !== iv[0] || blinkRateState[1] !== iv[1]) { blinkRateState = iv; emit("blinkrate", { state: st.name, intervalS: iv, perMin: +(60 / mean).toFixed(1) }); }
   }
@@ -369,8 +472,17 @@ export function createEngine(o = {}) {
   // a hesitant user (slow, quiet speech): softer, smaller aversions
   function listenAway() { const hes = user.turnS > 2 && user.voicedS / Math.max(0.1, user.turnS) < 0.45, side = rand() < 0.5 ? -1 : 1, a = persona.aversionDeg * rr(0.4, 0.65) * (hes ? 0.6 : 1); return { x: side * a, y: -rr(0.3, 0.6) * a, head: -side * rr(0.5, 1.2) }; }
   function setGaze(onUser, dur, kind, away) {
+    const from = gaze.onUser ? (user.pos || { x: 0, y: 0 }) : { x: gaze.x + mic.thinkOff.x, y: gaze.y + mic.thinkOff.y };
     gaze.onUser = onUser; gaze.kind = kind; gaze.until = T + dur; gaze.t0 = T;
     if (!onUser) { gaze.x = away.x; gaze.y = away.y; gaze.head = away.head || 0; gaze.headPitch = away.headPitch || 0; } else { gaze.head = 0; gaze.headPitch = 0; }
+    if (mon("gazeBlink")) {                                          // (micro) a blink with the gaze shift, likelier the larger it is
+      const to = onUser ? (user.pos || { x: 0, y: 0 }) : { x: gaze.x, y: gaze.y }, amp = Math.hypot(to.x - from.x, to.y - from.y), G = MC.gazeBlink, C = G.chance;
+      if (amp >= G.minDeg) {
+        let p = C[C.length - 1][1]; for (let i = 0; i < C.length - 1; i++) if (amp < C[i + 1][0]) { p = C[i][1] + (C[i + 1][1] - C[i][1]) * (amp - C[i][0]) / (C[i + 1][0] - C[i][0]); break; }
+        if (mrand() < p) { doBlink(true); emit("micro", { name: "gazeblink", t: T, amp }); }
+      }
+    }
+    mic.thinkOff = { x: 0, y: 0 }; mic.thinkNext = T + (MON ? mrA((MC.thinkSearch || {}).everyS || [0.45, 1.1]) : 0);
     emit("gaze", { onUser, kind, t: T, until: gaze.until });
   }
   function planGaze() {
@@ -409,7 +521,7 @@ export function createEngine(o = {}) {
     // idle / presence: the user (if any) half the time; after a long quiet the attention drifts (settle)
     const on = !gaze.onUser && !settled;
     if (on) setGaze(true, rrA(G.idle.onS), "user");
-    else { const a = listenAway(); if (settled) { a.y = -persona.aversionDeg * rr(0.7, 1); a.x *= 0.6; } setGaze(false, settled ? rr(4, 8) : rrA(G.idle.awayS), settled ? "settle" : "idle", a); }
+    else { const a = listenAway(); if (settled) { a.y = -persona.aversionDeg * rr(0.7, 1); a.x *= 0.6; } if (settled && MON) { a.x = mr(-1, 1) * persona.aversionDeg * 0.9; a.y = -persona.aversionDeg * mr(0.3, 1); a.head = -a.x * 0.12; }   /* (micro) a long quiet looks around, not between two spots */ setGaze(false, settled ? rr(4, 8) : rrA(G.idle.awayS), settled ? "settle" : "idle", a); }
   }
   // ---- breath: rest cycle 12-16 / min; inhales before replies and at her pauses; exhale across a phrase
   function inhale(dur, depth, at = T) { breath.inhale = { t0: at, dur, depth }; }
@@ -426,7 +538,7 @@ export function createEngine(o = {}) {
       const p = breath.phase, target = p < 0.4 ? ss(p / 0.4) : 1 - ss((p - 0.4) / 0.6);   // inhale 40 %, exhale 60 %
       breath.v += (target * cfg.breath.amp - breath.v) * Math.min(1, dt * 3);
     }
-    const k = Math.min(1, dt / 0.09); breath.o1 += (breath.v - breath.o1) * k; breath.out += (breath.o1 - breath.out) * k;   // two lags: no step in what the chest does
+    const k = lagK(dt, 0.09); breath.o1 += (breath.v - breath.o1) * k; breath.out += (breath.o1 - breath.out) * k;   // two lags: no step in what the chest does
   }
   // ---- gestures
   function nod(depth, opts = {}) {
@@ -462,6 +574,19 @@ export function createEngine(o = {}) {
         if (has("xSmileOpen")) { openSmile(cfg.expr.laugh * k, dur || 1.8, 0.15); if (has("xEyeSmile")) pulse(ctl("xEyeSmile"), dur || 1.8, cfg.expr.eyeSmile * k, env(dur || 1.8, 0.15, 0.6)); }
         else { smile(0.8 * k, dur || 1.8, 0.15); if (has("blink")) pulse(ctl("blink"), dur || 1.8, 0.15, u => bump(u)); }
         break;
+      // composites (micro). Each falls back to what the model has.
+      case "warm": { const d = dur || 2.4; smile(0.3 * k, d, 0.4); if (has("xEyeSmile")) pulse(ctl("xEyeSmile"), d, 0.3 * k, env(d, 0.4, Math.min(1.2, d * 0.5)));
+        if (has("xBrowUp")) pulse(ctl("xBrowUp"), d, 0.08 * k, env(d, 0.5, 0.8)); else if (has("browUp")) pulse(ctl("browUp"), d, 0.1 * k, env(d, 0.5, 0.8));
+        pulse("pitch", Math.min(d, 1.6), -0.6 * k, bump); break; }
+      case "curious": { const d = dur || 1.6; brow(0.45 * k, d); if (has("xEyesWide")) pulse(ctl("xEyesWide"), d, 0.12 * k, env(d, 0.2, 0.5));
+        const side = persona.tiltSide === "left" ? 1 : -1, room = Math.min(2.2, 0.8 * rollRoom(side)); if (room > 0.5) pulse("roll", d + 0.4, side * room * k, bump); break; }
+      case "concern": { const d = dur || 2; if (has("xSad")) pulse(ctl("xSad"), d, 0.22 * k, env(d, 0.3, 0.7)); if (has("xFrown")) pulse(ctl("xFrown"), d, 0.15 * k, env(d, 0.3, 0.7)); else if (has("furrow")) pulse(ctl("furrow"), d, 0.3 * k, env(d, 0.3, 0.7));
+        pulse("pitch", Math.min(d, 1.4), -0.5 * k, bump); break; }
+      case "surprise": { const d = dur || 1.1; if (has("xEyesWide")) pulse(ctl("xEyesWide"), d, 0.45 * k, env(d, 0.1, 0.5)); else if (has("blink")) pulse(ctl("blink"), d, -0.2 * k, env(d, 0.1, 0.5));
+        brow(0.65 * k, d); pulse("mouth:mid", d, 0.14 * k, env(d, 0.1, 0.5)); pulse("pitch", d, 0.8 * k, bump); break; }   // mid: gone while she speaks (the lip guard)
+      case "sad": { const d = dur || 2.6; if (has("xSad")) pulse(ctl("xSad"), d, 0.3 * k, env(d, 0.4, 1)); pulse("pitch", Math.min(d, 2), -0.8 * k, bump); break; }
+      case "hmm": { const d = dur || 1.4; gaze.override = { until: T + d }; setGaze(false, d, "think", thinkAway()); pulse("mouth:press", 0.5, 0.3 * k, bump);
+        if (has("xFrown")) pulse(ctl("xFrown"), d, 0.12 * k, env(d, 0.25, 0.5)); break; }
       case "brow": brow(0.7 * k, dur || 0.8); break;
       case "frown": if (has("xFrown")) pulse(ctl("xFrown"), dur || 1.5, cfg.expr.frown * k, env(dur || 1.5, 0.25, 0.5)); else if (has("furrow")) pulse(ctl("furrow"), dur || 1.5, 0.6 * k, env(dur || 1.5, 0.25, 0.5)); break;
       case "thinks": gaze.override = { until: T + (dur || 1.3) }; setGaze(false, dur || 1.3, "think", thinkAway()); break;
@@ -469,7 +594,7 @@ export function createEngine(o = {}) {
       case "nod": nod(persona.nodDeg * k, { double: false }); break;
       case "shake": {
         if (!o.canShake || !o.canShake()) { nod(1.2 * k); break; }     // far side must be clean at the current yaw; else a small nod
-        const dd = dur || 1.1; pulse("yaw", dd, 3 * k, u => Math.sin(2 * Math.PI * 2 * u) * bump(u)); break;
+        const dd = dur || 1.1; pulse("yaw", dd, (MON ? 4.8 : 3) * k, u =>   /* micro: the smooth follower passes less of a 2 Hz shake; 4.8 gives about the legacy amplitude (3.4 vs 3.1 deg p-p) */ Math.sin(2 * Math.PI * 2 * u) * bump(u)); break;
       }
       case "wide":
         if (has("xEyesWide")) { pulse(ctl("xEyesWide"), dur || 1, cfg.expr.wide * k, env(dur || 1, 0.15, 0.4)); brow(0.3 * k, dur || 1); break; }
@@ -480,6 +605,11 @@ export function createEngine(o = {}) {
         else signature(); break;                                       // no per-eye lid control: her slow blink + half smile instead
       }
       default: return;
+    }
+    if ((name === "laugh" || name === "grin") && mon("afterglow")) {   // (micro) the smile lingers in the eyes after the laugh, fading over seconds
+      const A = MC.afterglow, d0 = (dur || (name === "laugh" ? 1.8 : 1.4)) * 0.7, d = A.durS;
+      if (has("xEyeSmile")) pulse(ctl("xEyeSmile"), d, A.eyeSmile * k, env(d, 0.5, d * 0.7), T + d0);
+      pulse(ctl("smile"), d, A.smile * k, env(d, 0.5, d * 0.7), T + d0);
     }
     emit("cue", { name, t: T, opts });
   }
@@ -548,7 +678,7 @@ export function createEngine(o = {}) {
         tiltTarget = side * Math.min(want, 0.85 * rollRoom(side));
       }
       if (tl > 2) leanTarget = persona.leanIn * (0.6 + 0.6 * mood.engagement);
-      user.levelAvg += (user.level - user.levelAvg) * Math.min(1, dt / 2.5);
+      user.levelAvg += (user.level - user.levelAvg) * lagK(dt, 2.5);
       if (user.voice && user.level > user.levelAvg + 0.18) user.riseRun += dt; else user.riseRun = 0;
       if (user.riseRun > 0.3 && refractory("listenSmile", 7)) { smile(0.16, 2.2, 0.4); user.riseRun = 0; }
       if (tl > 2) user.rate = user.onsets / tl;                     // voice onsets per second: a rough pace
@@ -572,6 +702,15 @@ export function createEngine(o = {}) {
     reply.start = Array.isArray(clip.timings) && clip.timings.length ? (clip.timings.find(c => /[\p{L}\p{N}]/u.test(c.char || "")) || {}).start ?? 0 : ana ? ana.speechStart : 0;
     reply.yieldLead = rrA(cfg.gaze.yieldLeadS); reply.holdUntil = -1;
     if (ana && ana.speechStart > 0.35) inhale(Math.min(0.6, ana.speechStart), cfg.breath.deep);   // an inhale before the first word
+    reply.mw = []; reply.mwI = 0;
+    if (MON && Array.isArray(clip.timings) && (mon("words") || mon("hedgePress"))) {   // (micro) word-timed flickers; LLM tags near a word win
+      const W = microWordCues(clip.timings, MC.wordLists || MICRO_WORDS), tagT = reply.cues.map(c => c.t);
+      if (mon("words")) reply.mw = W.ev.filter(e => !tagT.some(t => Math.abs(t - e.t) < 0.7));
+      if (mon("hedgePress") && W.hedge !== null) {
+        const H = MC.hedgePress, t0 = T + (W.hedge - clipTime()) - H.gapS - H.durS;
+        if (t0 >= T && T - (last.hedgePreview ?? -99) > 3) { pulse("mouth:press", H.durS, H.amount, bump, t0); emit("micro", { name: "hedgepress", t: t0 }); }
+      }
+    }
     return ana;
   }
   function clipTime() { if (reply.clock) { const c = reply.clock(); if (Number.isFinite(c)) return c; } return T - reply.t0; }
@@ -583,6 +722,16 @@ export function createEngine(o = {}) {
       const c = reply.cues[reply.cueI++], k = c.strength ?? 1;
       const thru = c.name === "smile" ? Math.max(0.8, (c.phraseEnd ?? c.t + 1.5) - tc + 0.3) : undefined;
       cue(c.name, { strength: k, dur: thru });
+    }
+    // (micro) word-timed micro-expressions: 150-500 ms, low amplitude, at most one per refractoryS
+    while (reply.mw && reply.mwI < reply.mw.length && reply.mw[reply.mwI].t - (MC.words.leadS ?? 0.06) <= tc) {
+      const e = reply.mw[reply.mwI++], Wc = MC.words; if (e.t < tc - 0.15 || T - mic.lastWordCue < Wc.refractoryS) continue;
+      const k = persona.expressiveness;
+      if (e.kind === "pos") { const d = mr(0.38, 0.5); if (has("xEyeSmile")) pulse(ctl("xEyeSmile"), d, Wc.pos * k, env(d, 0.12, 0.26)); pulse(ctl("smile"), d + 0.15, 0.4 * Wc.pos * k, env(d + 0.15, 0.12, 0.3)); }
+      else if (e.kind === "neg") { const d = mr(0.42, 0.55); if (has("xSad")) pulse(ctl("xSad"), d, Wc.neg * k, env(d, 0.12, 0.3)); else if (has("furrow")) pulse(ctl("furrow"), d, 2 * Wc.neg * k, env(d, 0.12, 0.3)); }
+      else if (e.kind === "question") { if (T - (last.browBeat ?? -99) < 1) continue; last.browBeat = T; const d = mr(0.32, 0.45);
+        if (has("xBrowUp")) pulse(ctl("xBrowUp"), d, Wc.question * k, env(d, 0.1, 0.22)); else if (has("browUp")) pulse(ctl("browUp"), d, 1.2 * Wc.question * k, env(d, 0.1, 0.22)); }
+      mic.lastWordCue = T; emit("micro", { name: "word:" + e.kind, t: T, word: e.word });
     }
     if (!A) return;
     // accents: a nod scaled by pitch and energy (cap 4 deg incl. the rest of the head motion), a brow on the bigger pitch peaks
@@ -614,13 +763,95 @@ export function createEngine(o = {}) {
     emit("holdfloor", { t: T, until: T + s });
   }
 
+  // ---- micro (spikes/lf_micro): idle / quiet-listening events and the thinking search. Own random stream (mrand).
+  function stepMicro(dt) {
+    const s = st.name, quietUser = !user.voice && T - user.lastStop > 1.5, calm = (s === "idle" || (s === "listening" && quietUser)) && !reply.active;
+    if (mon("swallow") && T >= mic.swallowAt) {                     // a swallow: a small chin dip with the lips pressed, sometimes a blink after
+      const S = MC.swallow;
+      if (calm && !gaze.override && !pendingNod) { pulse("pitch", 0.8, -S.pitchDeg, bump); pulse("mouth:press", 0.55, S.press, bump, T + 0.1); if (mrand() < 0.35) blinkLater(0.7); mic.swallowAt = T + mrA(S.everyS); emit("micro", { name: "swallow", t: T }); }
+      else mic.swallowAt = T + mr(3, 8);
+    }
+    if (mon("lipPart")) {                                            // idle only: the lips part a little for a few seconds
+      const L = MC.lipPart;
+      if (mic.lipUntil > T && s !== "idle") mic.lipUntil = T;
+      if (T >= mic.lipAt) { if (s === "idle") { mic.lipUntil = T + mrA(L.holdS); mic.lipAmt = mrA(L.amount); mic.lipAt = mic.lipUntil + mrA(L.everyS); emit("micro", { name: "lippart", t: T }); } else mic.lipAt = T + mr(4, 10); }
+      const want = T < mic.lipUntil ? mic.lipAmt : 0; mic.lip += (want - mic.lip) * lagK(dt, (want > mic.lip ? 0.6 : 0.25));
+    }
+    if (mon("shift")) {                                              // idle: the posture settles somewhere new with a breath; back to centre in the other states
+      const S = MC.shift;
+      if (T >= mic.shiftAt) {
+        if (s === "idle" && !gaze.override) { mic.shiftT = { yaw: mr(-1, 1) * S.yawDeg, pitch: mr(-1, 1) * S.pitchDeg, roll: mrA(S.rollDeg) }; inhale(0.9, 0.75); mic.shiftAt = T + mrA(S.everyS); emit("micro", { name: "shift", t: T }); }
+        else mic.shiftAt = T + mr(4, 10);
+      }
+      if (s !== "idle") mic.shiftT = { yaw: 0, pitch: 0, roll: 0 };
+      const k = lagK(dt, (s === "idle" ? 1.4 : 2.0)); for (const a of ["yaw", "pitch", "roll"]) mic.shift[a] += (mic.shiftT[a] - mic.shift[a]) * k;
+    }
+    if (mon("thinkSearch") && !gaze.onUser && (gaze.kind === "think" || gaze.kind === "read") && T >= mic.thinkNext) {   // small saccades around the aversion
+      const S = MC.thinkSearch, a = mr(0, 2 * Math.PI), r = mrA(S.stepDeg), rd = gaze.kind === "read";
+      mic.thinkOff = { x: clamp(mic.thinkOff.x * 0.3 + r * Math.cos(a) * (rd ? 1.6 : 1), -4.5, 4.5), y: clamp(mic.thinkOff.y * 0.3 + r * Math.sin(a) * (rd ? 0.25 : 0.6), -2.5, 2.5) };
+      mic.thinkNext = T + mrA(S.everyS);
+    }
+  }
+  // ---- idle director (spikes/lf_micro): a varied idle repertoire. Weighted choice with cooldowns and a no-repeat penalty, lognormal gaps scaled by a
+  // slowly wandering activity level (busier and calmer minutes), a few persona-stable "places" in the room she returns to, action length added to the gap.
+  function dirPlaces() {
+    if (DIR.places) return DIR.places; const r = seededRandom((persona.seed || 1) * 313 + 7);
+    DIR.places = [{ x: -15 + 4 * r(), y: -4 + 3 * r() }, { x: 12 + 5 * r(), y: 3 + 4 * r() }, { x: -6 + 3 * r(), y: 8 + 2 * r() }, { x: 4 - 8 * r(), y: -9 + 2 * r() }, { x: 16 + 3 * r(), y: -6 + 3 * r() }];
+    return DIR.places;
+  }
+  function dirOk(k) {
+    if (k === "smile") return has("smile") || has("xEyeSmile"); if (k === "wide") return has("xEyesWide") || has("blink"); if (k === "lips") return has("mid") && MON;
+    if (k === "swallow" || k === "shift") return MON; if (k === "longblink" || k === "signature") return has("blink"); return true;
+  }
+  function dirRun(k, R) {
+    const r2 = (a, b) => a + (b - a) * R(), sgn = () => (R() < 0.5 ? -1 : 1);
+    switch (k) {
+      case "glance": { const d = r2(0.6, 1.6), x = sgn() * r2(6, 16), y = r2(-6, 5); gaze.override = { until: T + d }; setGaze(false, d, "glance", { x, y, head: -x * 0.15, headPitch: y * 0.06 }); return d; }
+      case "place": { const P = dirPlaces(); let i = Math.floor(R() * P.length); if (i === DIR.lastPlace) i = (i + 1 + Math.floor(R() * (P.length - 1))) % P.length; DIR.lastPlace = i;
+        const d = r2(1.2, 3), p = P[i]; gaze.override = { until: T + d }; setGaze(false, d, "place", { x: p.x + r2(-1, 1), y: p.y + r2(-1, 1), head: -p.x * 0.2, headPitch: p.y * 0.1 }); return d; }
+      case "read": { const d = r2(2.5, 5); gaze.override = { until: T + d }; setGaze(false, d, "read", { x: r2(-4, 4), y: -r2(7.5, 10), head: 0, headPitch: -r2(0.6, 1.2) }); return d; }
+      case "smile": { const d = r2(1.6, 2.6); smile(r2(0.1, 0.18), d, 0.45); if (has("xEyeSmile")) pulse(ctl("xEyeSmile"), d, r2(0.1, 0.18), env(d, 0.45, 0.9)); return d; }
+      case "brow": brow(r2(0.25, 0.4), r2(0.55, 0.8)); return 0.8;
+      case "thinks": { const d = r2(1.2, 2.2); cue("thinks", { dur: d }); if (R() < 0.4 && has("xFrown")) pulse(ctl("xFrown"), d, 0.1, env(d, 0.3, 0.5)); return d; }
+      case "shift": mic.shiftAt = T; return 1.5;
+      case "swallow": mic.swallowAt = T; return 0.9;
+      case "lips": mic.lipAt = T; return 1;
+      case "sigh": { inhale(0.9, 1); pulse("breathOut", 2.2, 1, u => u, T + 1.1); const d = 2.6; gaze.override = { until: T + d }; setGaze(false, d, "sigh", { x: r2(-3, 3), y: -r2(5, 8), head: 0, headPitch: -0.5 }); return d; }
+      case "nod": nod(r2(1, 1.6), { double: false, dur: 0.7 }); return 0.8;
+      case "checkin": { const d = r2(1.5, 2.8); gaze.override = { until: T + d }; setGaze(true, d, "user"); brow(0.22, 0.7); smile(0.1, 1.8, 0.4); return d; }
+      case "longblink": longBlink(); return 0.7;
+      case "signature": signature(); return 1.8;
+      case "wide": cue("wide", { strength: 0.35, dur: 0.9 }); return 0.9;
+      default: return 0;                                             // quiet
+    }
+  }
+  function stepDirector() {
+    const C = DIR.cfg;
+    if (!DIR.rand) { DIR.rand = o.directorRandom || seededRandom((persona.seed || 1) * 4241 + 99); DIR.actN = makeNoise(DIR.rand, [{ hz: C.activityHz || 0.012, amp: 1 }, { hz: 3 * (C.activityHz || 0.012), amp: 0.4 }]); DIR.next = T + 1.5; }
+    if (st.name !== "idle" || T < DIR.pauseUntil) { DIR.next = Math.max(DIR.next, T + 1.5); return; }
+    if (T < DIR.next) return;
+    const R = DIR.rand, act = clamp(1 + 0.55 * DIR.actN(T), 0.45, 1.6), W = C.weights || {}, cd = C.cooldownS || {};
+    const cand = []; let tot = 0;
+    for (const k of Object.keys(W)) {
+      if (!dirOk(k) || (k === DIR.prev && k === DIR.prev2)) continue; const age = T - (DIR.last[k] ?? -1e9); if (age < (cd[k] ?? 0)) continue;
+      let w = W[k] * (k === DIR.prev ? 0.15 : 1) * (1 - Math.exp(-age / Math.max(6, 2 * (cd[k] || 3))));
+      if (k === "quiet") w *= clamp(2 - act, 0.4, 1.6);
+      if (w > 0) { cand.push([k, w]); tot += w; }
+    }
+    let k = "quiet", x = R() * tot; for (const [n, w] of cand) { x -= w; if (x <= 0) { k = n; break; } }
+    const d = dirRun(k, R) || 0; DIR.last[k] = T; DIR.prev2 = DIR.prev; DIR.prev = k; DIR.log.push({ t: +T.toFixed(3), name: k, act: +act.toFixed(2) }); if (DIR.log.length > 1000) DIR.log.shift();
+    emit("director", { name: k, t: T });
+    const gz = Math.sqrt(-2 * Math.log(1 - R())) * Math.cos(2 * Math.PI * R());
+    DIR.next = T + d + clamp(C.medianS * Math.exp(C.sigma * gz) / act, C.minS, C.maxS);
+  }
+
   // ---- the frame
   const ctlOut = {};
   function step(f = {}) {
     const dt = clamp(f.dt ?? 1 / 60, 0, 0.25); T += dt; blinkNow = pendingBlink; pendingBlink = false; inStep = true;
     for (const k of Object.keys(ctlOut)) delete ctlOut[k];
     // mood eases toward its target (seconds)
-    for (const k of ["valence", "arousal", "engagement"]) mood[k] += (moodT[k] - mood[k]) * Math.min(1, dt / 1.5);
+    for (const k of ["valence", "arousal", "engagement"]) mood[k] += (moodT[k] - mood[k]) * lagK(dt, 1.5);
     // speaking from the viewer (clip playing + driver), with a hangover across her own pauses
     const vs = !!f.speaking;
     if (vs) { speakingFor += dt; notSpeakingFor = 0; reply.lastSpeak = T; } else { notSpeakingFor += dt; speakingFor = 0; }
@@ -639,7 +870,7 @@ export function createEngine(o = {}) {
     if (st.auto && st.name === "thinking" && T - st.since > cfg.thinkTimeoutS) setState("listening");
     if (st.auto && st.name === "listening" && !user.inTurn && T - Math.max(user.lastStop, st.since) > cfg.idleAfterS) setState("idle");
     if (st.name === "idle") { idleQuiet += dt; if (idleQuiet > (o.settleAfterS ?? 30)) settled = true; } else { idleQuiet = 0; settled = false; }
-    stepUser(dt); stepReply(dt, f); planGaze(); stepBreath(dt); applyBlinkRate();
+    stepUser(dt); stepReply(dt, f); if (DIR.on) stepDirector(); if (MON) stepMicro(dt); planGaze(); stepBreath(dt); applyBlinkRate();
 
     // ---- head: band-limited noise (scaled by arousal), gaze-led head turn, tilt, prosody pitch, pulses; then the acceleration bound
     const ar = 0.6 + 0.8 * mood.arousal, sp = st.name === "speaking";
@@ -647,10 +878,12 @@ export function createEngine(o = {}) {
     if (!gaze.onUser) { yaw += gaze.head || 0; pitch += gaze.headPitch || 0; }
     else if (user.pos) yaw -= clamp(user.pos.x * 0.3, -6, 6);        // part of the way toward where the user actually is (camera attention)
     if (settled) pitch -= 1.2;
-    tilt += (tiltTarget - tilt) * Math.min(1, dt / 0.9); roll += tilt;
-    lean += (leanTarget - lean) * Math.min(1, dt / 0.6); zoom -= lean;   // closer
-    const fz = sp && reply.active && reply.ana ? reply.ana.f0zAt(clipTime()) : 0; headF0 += (fz - headF0) * Math.min(1, dt / 0.15);
+    tilt += (tiltTarget - tilt) * lagK(dt, 0.9); roll += tilt;
+    lean += (leanTarget - lean) * lagK(dt, 0.6); zoom -= lean;   // closer
+    const fz = sp && reply.active && reply.ana ? reply.ana.f0zAt(clipTime()) : 0; headF0 += (fz - headF0) * lagK(dt, 0.15);
     { const P = cfg.prosody; pitch += clamp(headF0 * P.pitchDegPerZ * persona.expressiveness, -P.pitchDownMax, P.pitchUpMax); }   // the head follows the pitch (Munhall)
+    if (MON) { yaw += mic.shift.yaw; pitch += mic.shift.pitch; roll += mic.shift.roll; }   // (micro) idle posture shifts
+    const mouthOut = {};
         for (let i = pulses.length - 1; i >= 0; i--) {
       const p = pulses[i], u = (T - p.t0) / p.dur;
       if (u < 0) continue;
@@ -661,6 +894,7 @@ export function createEngine(o = {}) {
       if (p.ch === "pitch") pitch += v; else if (p.ch === "yaw") yaw += v; else if (p.ch === "roll") roll += v; else if (p.ch === "zoom") zoom += v;
       else if (p.ch === "breathOut") breath.v = Math.max(0, breath.v - 0.02 * v);
       else if (p.ch.startsWith("ctl:")) { const n = p.ch.slice(4); ctlOut[n] = (ctlOut[n] || 0) + v; }
+      else if (p.ch.startsWith("mouth:")) { const n = p.ch.slice(6); mouthOut[n] = (mouthOut[n] || 0) + v; }   // lip gestures: only while no speech (below)
     }
     // chin down: throat flecks below -3. Stay inside the viewer's limits short of its soft knee (it eases from 75 % of the room), so its knee adds no jerk
     { const L = o.limits ? o.limits() : null, dn = L && L.pitch ? -L.pitch[0] / DEG : 3.5, up = L && L.pitch ? L.pitch[1] / DEG : 4; pitch = clamp(pitch, -Math.min(cfg.maxNodDeg - 0.5, 0.82 * dn), 0.72 * up); }
@@ -685,8 +919,15 @@ export function createEngine(o = {}) {
     // the reply gap: lips part slightly (mid 0.15) while thinking; gone before the first sound
     const anySpeech = ["ah", "wide", "oo", "ee", "mid", "press"].some(n => (dw[n] || 0) > 0.02);
     const wantLip = st.name === "thinking" && T - st.since > 0.5 && !anySpeech && !vs ? 0.15 : 0;
-    lipPart += (wantLip - lipPart) * Math.min(1, dt / (wantLip > lipPart ? 0.35 : 0.06)); if (anySpeech || vs) lipPart = Math.min(lipPart, 0.15 * Math.max(0, 1 - 20 * (dw.press || 0)));
+    lipPart += (wantLip - lipPart) * lagK(dt, (wantLip > lipPart ? 0.35 : 0.06)); if (anySpeech || vs) lipPart = Math.min(lipPart, 0.15 * Math.max(0, 1 - 20 * (dw.press || 0)));
     if (has("mid") && lipPart > 0.002) ctlOut.mid = (ctlOut.mid || 0) + lipPart;
+    // (micro) lip gestures (press before a hedge, swallow, surprise, idle lip part): never while the driver shows speech or the clip plays
+    if (MON) {
+      const quiet = !anySpeech && !vs;
+      if (!quiet) mic.lip = 0;
+      if (quiet && mic.lip > 0.002 && has("mid")) ctlOut.mid = (ctlOut.mid || 0) + mic.lip;
+      if (quiet) for (const n of Object.keys(mouthOut)) if (has(n)) ctlOut[n] = (ctlOut[n] || 0) + mouthOut[n];
+    }
     if (sp && reply.active) {
       const P = cfg.prosody, open = ["ah", "wide", "oo", "ee", "mid"].filter(has), sum = open.reduce((s, n) => s + (dw[n] || 0), 0);
       // energy-scaled vowel opening (3.5.1): only on open vowels (sum > 0.2), never on a closure (press), and never past an opening sum of 1
@@ -703,21 +944,39 @@ export function createEngine(o = {}) {
       if (has("xSmileAh") && sm > 0.2 && (dw.press || 0) < 0.05) ctlOut.xSmileAh = (ctlOut.xSmileAh || 0) + Math.min(cfg.expr.smileAhMax, cfg.expr.smileAh * ss((sm - 0.2) / 0.5) * (dw.ah || 0));
     }
     // the open smile never fights the speech driver: gone on a closure, a fifth of it while she talks (the corrective above carries the laugh)
-    if (ctlOut.xSmileOpen) {
+    if (MON) {                                                       // (micro, MOTION request 1) a continuous gate: no frame-to-frame chatter between words
+      const openV = Math.max(dw.ah || 0, dw.wide || 0, dw.oo || 0, dw.ee || 0), closeF = Math.max(ss((dw.press || 0) / 0.3), ss((dw.mid || 0) / 0.2) * (1 - ss(openV / 0.1)));
+      mic.spk += ((vs || anySpeech ? 1 : 0) - mic.spk) * lagK(dt, 0.08);
+      const gT = (1 - closeF) * (1 - 0.8 * ss(mic.spk)); mic.og = gT < mic.og ? gT : mic.og + (gT - mic.og) * lagK(dt, 0.09);   // drops at once (gone on every closure), comes back eased: no flash between words
+      if (ctlOut.xSmileOpen) ctlOut.xSmileOpen *= mic.og;
+    } else if (ctlOut.xSmileOpen) {
       const closing = (dw.press || 0) > 0.02 || ((dw.mid || 0) > 0.02 && !["ah", "wide", "oo", "ee"].some(n => (dw[n] || 0) > 0.05));
       ctlOut.xSmileOpen *= closing ? 0 : (vs || anySpeech ? 0.2 : 1);
     }
     // caps: trained expressions stay modest; the mouth ones together under openMax
     const capX = { xBrowUp: cfg.expr.browMax, xFrown: cfg.expr.frownMax, xEyeSmile: cfg.expr.eyeSmileMax, xEyesWide: cfg.expr.wideMax, xSad: cfg.expr.sadMax, xSmileOpen: cfg.expr.openMax, xSmileAh: cfg.expr.smileAhMax };
+    const tinyT = MON && tier === "tiny", openMax = tinyT ? Math.min(cfg.expr.openMax, cfg.expr.tinyOpenMax) : cfg.expr.openMax;
+    if (tinyT) { capX.xSmileOpen = Math.min(capX.xSmileOpen, cfg.expr.tinyOpenMax); capX.xSmileAh = Math.min(capX.xSmileAh, cfg.expr.tinySmileAhMax); }
     for (const n of Object.keys(capX)) if (ctlOut[n] !== undefined) ctlOut[n] = clamp(ctlOut[n], 0, capX[n]);
-    if ((ctlOut.xSmileOpen || 0) + (ctlOut.xSmileAh || 0) > cfg.expr.openMax) { const f2 = cfg.expr.openMax / ((ctlOut.xSmileOpen || 0) + (ctlOut.xSmileAh || 0)); if (ctlOut.xSmileOpen) ctlOut.xSmileOpen *= f2; if (ctlOut.xSmileAh) ctlOut.xSmileAh *= f2; }
+    if ((ctlOut.xSmileOpen || 0) + (ctlOut.xSmileAh || 0) > openMax) { const f2 = openMax / ((ctlOut.xSmileOpen || 0) + (ctlOut.xSmileAh || 0)); if (ctlOut.xSmileOpen) ctlOut.xSmileOpen *= f2; if (ctlOut.xSmileAh) ctlOut.xSmileAh *= f2; }
+    // (micro) the gaze shown: + the thinking search, + slow drift; the upper lid follows the eyes' pitch in the head (target minus head pitch)
+    const g = gaze.onUser ? { x: user.pos ? user.pos.x : 0, y: user.pos ? user.pos.y : 0 } : { x: gaze.x, y: gaze.y };
+    if (MON) {
+      if (!gaze.onUser) { g.x += mic.thinkOff.x; g.y += mic.thinkOff.y; }
+      if (mon("drift")) { const D = MC.drift; g.x += D.deg * mic.drift.x(T); g.y += 0.7 * D.deg * mic.drift.y(T); }
+      if (mon("lid") && has("blink")) {
+        const L = MC.lid, ey = (f.state && Array.isArray(f.state.gaze) ? f.state.gaze[1] : g.y) - pitch;
+        const want = clamp(ey < 0 ? -ey * L.downPerDeg : -ey * L.upPerDeg, L.min, L.max);
+        mic.lid += (want - mic.lid) * lagK(dt, L.tauS); ctlOut.blink = (ctlOut.blink || 0) + mic.lid;   // range-clamped below
+        if (L.totalMax !== undefined && mic.lid > 0) ctlOut.blink = Math.min(ctlOut.blink, Math.max(L.totalMax, ctlOut.blink - mic.lid));   // the follow never takes the held lid past totalMax
+      }
+    }
     // clamp every control to its range (current + delta)
     for (const n of Object.keys(ctlOut)) {
       if (!has(n)) { delete ctlOut[n]; continue; }
       const r0 = ranges[n] || [-1, 1.4], r = n === "blink" ? [-0.25, Math.max(1, r0[1])] : r0, cur = dw[n] || 0, lo = n === "smile" ? 0 : r[0], hi = n === "smile" ? Math.min(r[1], 1) : r[1];
       ctlOut[n] = clamp(cur + ctlOut[n], lo, hi) - cur;
     }
-    const g = gaze.onUser ? { x: user.pos ? user.pos.x : 0, y: user.pos ? user.pos.y : 0 } : { x: gaze.x, y: gaze.y };
     inStep = false;
     return { yaw: yaw * DEG, pitch: pitch * DEG, roll: roll * DEG, zoom, controls: { ...ctlOut }, gaze: g, blinkNow,
              debug: { state: st.name, onUser: gaze.onUser, gazeKind: gaze.kind, yawDeg: yaw, pitchDeg: pitch, rollDeg: roll, breath: bv } };
@@ -733,6 +992,22 @@ export function createEngine(o = {}) {
     get mood() { return { ...mood }; }, persona,
     glanceAt(x, y, dur = 0.8) { if (st.name === "speaking" || st.name === "listening" && user.voice) return false; if (!refractory("pointer", 4)) return false; gaze.override = { until: T + dur }; setGaze(false, dur, "pointer", { x, y, head: -clamp(x * 0.2, -3, 3) }); return true; },
     noticeUser: notice, signature,
+    // (micro) idle director: setDirector(true | false | { ...DEFAULT_BEHAVIOUR.director overrides }); pauseDirector(s) e.g. while the user drags
+    setDirector(v) { if (v && typeof v === "object") { DIR.cfg = mergeDeep(DIR.cfg, v); DIR.on = v.enabled !== false; } else DIR.on = !!v; return DIR.on; },
+    pauseDirector(s = 3) { DIR.pauseUntil = Math.max(DIR.pauseUntil, T + s); },
+    get director() { return { enabled: DIR.on, log: DIR.log.slice() }; },
+    get micro() { return MON; },
+    // (micro) the reply's text is known (LLM done, TTS still working): an answer that opens with a hedge ("Well, ...", "Hmm", "Honestly") presses the
+    // lips now, during the wait. Tags are fine in the text. Returns true when it reacted. No-op with micro off.
+    preview(text) {
+      if (!mon("hedgePress") || st.name === "speaking") return false;
+      const clean = parseTags(String(text || "")).text, m = /^\s*([A-Za-z']+)\s*([,.!?…-])?/.exec(clean); if (!m) return false;
+      const f = m[1].toLowerCase(), lists = MC.wordLists || MICRO_WORDS;
+      if (!(lists.hedge.includes(f) && (m[2] === "," || m[2] === "…" || m[2] === "-" || ["hmm", "um", "uh"].includes(f)))) return false;
+      if (!refractory("hedgePreview", 4)) return false;
+      const H = MC.hedgePress; pulse("mouth:press", H.durS + 0.1, H.amount, bump, T + 0.1); if (has("xFrown")) pulse(ctl("xFrown"), 0.9, 0.08, env(0.9, 0.2, 0.4), T + 0.05);
+      emit("micro", { name: "hedgepress", t: T }); return true;
+    },
     remember(m) { Object.assign(memo, m || {}); if (memo.visits > 1 && !memo.greeted) { memo.greeted = true; smile(0.3, 2.6, 0.5); brow(0.4, 0.9); } },
     get memory() { return { ...memo }; },
     get debug() { return { state: st.name, gaze: { ...gaze }, breath: breath.v, pulses: pulses.length, user: { ...user }, reply: { active: reply.active, end: reply.end, yielded: reply.yielded } }; }
@@ -760,7 +1035,9 @@ export function createBehaviour(viewer, o = {}) {
   const yawLim = () => { const L = viewer.limits; return L && L.yaw ? L.yaw[1] / DEG : 35; };
   const canShake = () => Math.abs((viewer.basePose ? viewer.basePose.yaw : 0) / DEG) + 4 <= Math.min(20, yawLim());
   const canWink = () => Math.abs((viewer.basePose ? viewer.basePose.yaw : 0) / DEG) <= 20;
-  const eng = createEngine({ ...o, controls: ctlList, ranges, canShake, canWink, limits: () => viewer.limits || null });
+  const nG = viewer.info && Number.isFinite(viewer.info.n) ? viewer.info.n : null, tinyMax = ((o.config && o.config.expr) || {}).tinyMaxGaussians ?? DEFAULT_BEHAVIOUR.expr.tinyMaxGaussians;
+  const tier = o.tier ?? (nG !== null && nG <= tinyMax ? "tiny" : null);   // (micro) the tiny tier gets lower open-smile caps
+  const eng = createEngine({ ...o, tier, controls: ctlList, ranges, canShake, canWink, limits: () => viewer.limits || null });
   let enabled = o.enabled !== false, listener = null, offs = [], attention = null, savedPreset = null, last = null;
   const mode = typeof viewer.addLayer === "function" ? "layer" : "stub";
   const AC = { buf: null };
@@ -882,4 +1159,4 @@ export function createBehaviour(viewer, o = {}) {
   return api;
 }
 
-export default { createBehaviour, createEngine, analyseClip, pitchMcLeod, parseTags, anchorCues, makePersona, createVoiceDetector, seededRandom, makeNoise, makeFollower, DEFAULT_PERSONA, DEFAULT_BEHAVIOUR, TAGS, STATES, BEHAVIOUR_VERSION };
+export default { createBehaviour, createEngine, makeSmoothFollower, analyseClip, pitchMcLeod, parseTags, anchorCues, timingWords, microWordCues, MICRO_WORDS, LEGACY_TAGS, makePersona, createVoiceDetector, seededRandom, makeNoise, makeFollower, DEFAULT_PERSONA, DEFAULT_BEHAVIOUR, TAGS, STATES, BEHAVIOUR_VERSION };

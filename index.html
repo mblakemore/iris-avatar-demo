@@ -49,7 +49,7 @@
   <p class="hint">Drag to turn her head · scroll or pinch to zoom</p>
   <span id="state" hidden></span>
 </header>
-<div id="info"><div id="stats"></div><div>Iris model v23d</div><a href="https://github.com/mblakemore" target="_blank" rel="noopener">github.com/mblakemore</a></div>
+<div id="info"><div id="stats"></div><div>Iris model v23h</div><a href="https://github.com/mblakemore" target="_blank" rel="noopener">github.com/mblakemore</a></div>
 <div id="msg">Loading…</div>
 <div id="dock" hidden>
   <div id="cap" aria-live="off" hidden></div>
@@ -133,7 +133,7 @@ try {
   // drag to turn her head (drag up = she looks up), wheel / pinch to zoom
   const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
   const base = { yaw: 0, pitch: 0, zoom: 1 }; let lastTouch = 0;
-  const pose = (p, user = true) => { Object.assign(base, p); if (user) lastTouch = performance.now(); v.setPose(p); };
+  const pose = (p, user = true, opts) => { Object.assign(base, p); if (user) { lastTouch = performance.now(); b.pauseDirector(4); } v.setPose(p, opts); };
   const c = $("c"), ptr = new Map(); let pinch = 0, down = null;
   c.addEventListener("pointerdown", e => {
     c.setPointerCapture(e.pointerId); ptr.set(e.pointerId, [e.clientX, e.clientY]);
@@ -164,39 +164,19 @@ try {
   (function tick() {
     const now = performance.now(), off = Math.abs(base.yaw) + Math.abs(base.pitch);
     if (from) {
+      b.pauseDirector(1);
       const u = Math.min(1, (now - t0) / RETURN_TIME), k = 1 - u * u * (3 - 2 * u);
       pose({ yaw: from.yaw * k, pitch: from.pitch * k }, false);
       if (u >= 1 || lastTouch > t0 || ptr.size) from = null;
     } else if (off > 1e-4 && now - lastTouch > RETURN_AFTER && !ptr.size) { from = { yaw: base.yaw, pitch: base.pitch }; t0 = now; }
     requestAnimationFrame(tick);
   })();
-  $("reset").onclick = () => { from = null; pose({ yaw: 0, pitch: 0, zoom: 1 }); };
+  $("reset").onclick = () => { from = null; pose({ yaw: 0, pitch: 0, zoom: 1 }, true, { easeS: 0.12 }); };   // eased, about half a second
 
-  // idle life: between lines she looks around, lets her head drift and tilt, and lets small expressions cross her face.
-  // All of it is quiet (low strengths, slow eases), random in timing, and stops while she talks, while you drag, or while her head returns.
-  const R = (lo, hi) => lo + Math.random() * (hi - lo), pickW = list => { let r = Math.random() * list.reduce((s, x) => s + x[0], 0); for (const x of list) if ((r -= x[0]) <= 0) return x[1]; return list[0][1]; };
-  const idleOK = () => a.paused && !pending && !ptr.size && !from && performance.now() - lastTouch > 2500 && !document.hidden;
-  const drift = { y: 0, p: 0, r: 0, ty: 0, tp: 0, tr: 0 };
-  let lastT = performance.now();
-  v.addLayer(() => {                                       // the head's slow wander, added on top of the pose
-    const now = performance.now(), dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
-    const q = idleOK() ? 1 : 0, k = 1 - Math.exp(-dt / 1.1);
-    drift.y += (drift.ty * q - drift.y) * k; drift.p += (drift.tp * q - drift.p) * k; drift.r += (drift.tr * q - drift.r) * k;
-    return { yawDeg: drift.y, pitchDeg: drift.p, rollDeg: drift.r };
-  });
-  const later = (ms, f) => setTimeout(() => { if (idleOK()) f(); }, ms);
-  const ACTIONS = [
-    [30, () => b.glanceAt(R(10, 24) * (Math.random() < 0.5 ? -1 : 1), R(-6, 7), R(1.2, 2.6))],                                   // looks somewhere else for a moment
-    [18, () => { drift.ty = Math.random() < 0.35 ? 0 : R(-7, 7); drift.tp = R(-1.2, 1.2); drift.tr = Math.random() < 0.5 ? 0 : R(0, 2.5); }],   // head wanders, settles, tilts
-    [14, () => b.cue("smile", { strength: R(0.55, 1), dur: R(2, 3.6) })],                                                        // a soft smile, eyes included
-    [7, () => b.cue("brow", { strength: R(0.4, 0.7), dur: R(0.8, 1.3) })],                                                        // a small brow lift
-    [7, () => { b.cue("thinks", { dur: R(1.2, 2) }); if (Math.random() < 0.4) later(500, () => b.cue("frown", { strength: 0.3, dur: 1.4 })); }],   // a passing thought
-    [4, () => { b.glanceAt(R(-14, 14), R(-2, 4), 1.4); later(250, () => b.cue("wide", { strength: 0.35, dur: 0.9 })); }],         // something catches her eye
-    [4, () => b.cue("nod", { strength: 0.5 })],                                                                                   // a small nod to herself
-    [4, () => b.signature()],                                                                                                     // her slow blink with a half smile
-  ];
-  (function idleTick() { if (idleOK()) pickW(ACTIONS)(); setTimeout(idleTick, R(2600, 6500)); })();
-
+  // idle life: the behaviour module's own idle director. Between lines she looks around the room and back at you, shifts her posture,
+  // smiles, lifts her brows, has a passing thought, swallows, sighs, with irregular timing and no back-to-back repeats.
+  // It only runs while she is idle, and pauses while you drag or zoom and while her head returns to centre.
+  b.setDirector(true);
   let hiddenAt = 0;
   document.addEventListener("visibilitychange", () => { if (document.hidden) hiddenAt = performance.now(); else if (hiddenAt && performance.now() - hiddenAt > 5000) b.noticeUser(); });
   addEventListener("keydown", e => {

@@ -99,7 +99,24 @@ export const DEFAULT_PRESET = {
             blinkOnSaccadeDeg: 10, blinkOnSaccadeChance: 0.5 }   // a saccade this large blinks with this chance
   },
   speech: { swayWhileSpeaking: true, emphasisDeg: 1, blinkFaster: true, aversionsWhileSpeaking: true,
-            beat: { enabled: true, nodDeg: 0.9, settleDeg: 0.6 } }   // head co-motion from the speech: a small nod on phrase starts and stressed vowels, a slight settle at phrase ends (needs idle motion on)
+            beat: { enabled: true, nodDeg: 0.9, settleDeg: 0.6 } },   // head co-motion from the speech: a small nod on phrase starts and stressed vowels, a slight settle at phrase ends (needs idle motion on)
+  // (spikes/lf_motion) the temporal layer: no steps or kinks in what is shown. enabled: false = the motion before 2026-11-26, frame for frame.
+  // Seconds are time constants T of critically damped followers (x'' = (u - x) / T^2 - 2 x' / T): no overshoot, a ramp lags by 2 T, a step in the
+  // input's velocity or acceleration comes out continuous.
+  motion: { enabled: true,
+            poseS: 0.035,                          // layers' head offsets (yaw, pitch, roll, zoom): a bounded-acceleration or exponential input gets a continuous acceleration
+            exprS: 0.045,                          // layers' expression deltas (smile, x controls, brows, lids, breath): no one-frame steps, rounded corners at caps
+            mouthExprS: [0.05, 0.012],             // ...the expression controls that open the mouth (mouthExpr), rising / falling: they leave a closure within ~25 ms
+            mouthExpr: ["xSmileOpen", "xSmileAh"],
+            closureGate: true,                     // the mouth-opening expressions fade with the lips' press (1 - smoothstep(press / 0.5)): no teeth through a closure, whatever a layer sends
+            blinkGate: ["xEyesWide"],              // layer deltas that fight a closing lid fade with the blink (1 - smoothstep(blink / 0.8)): wide eyes + a blink smeared the shut lid (sheets/combos_eyes.jpg)
+            raw: [],                               // more control names a layer sets unfiltered (the speech shapes but smile, gazeX / gazeY and press are always unfiltered)
+            softLimit: true,                       // a layer's control delta eases into the control's range (as the pose does) instead of a flat-topped clamp
+            idleSaccade: true,                     // classic idle gaze: saccades on the main sequence (25 ms + 2.4 ms / deg, minimum jerk) instead of 80-150 ms smoothsteps
+            swaySpline: true,                      // classic idle sway: a C1 spline through the random targets (no stop at each one)
+            beatEaseIn: true,                      // the speech beat eases in when a clip starts mid-beat (it stepped by up to 0.5 deg)
+            pursuitOrder2: true,                   // eye model: smooth pursuit as a critically damped follower (pursuitS / 2) instead of a first-order lag (velocity steps)
+            pointerS: 0.03 }                       // enablePointer: drags ease the pose (setPose(p, { easeS })); 0 = set at once
 };
 
 // ------------------------------------------------------------------ render options (spikes/lf_render; ROADMAP 3.4). ALL OFF BY DEFAULT: with these values a frame
@@ -601,9 +618,9 @@ function makeRelease(n, eps, T = SPEECH_RELEASE_S, out = 2) {           // out: 
     get active() { return u < T; },
     reset() { prev.fill(0); vel.fill(0); u = Infinity; },
     // live: this frame's values without the release (overwritten with what is shown); cut: the speech was cut since the last frame
-    step(dt, live, cut) {
+    step(dt, live, cut, fromZero = false) {                         // fromZero (spikes/lf_motion): also ease when the held value was 0 and the new one is not (a clip starting mid-beat)
       if (cut) {
-        let held = 0; for (let i = 0; i < n; i++) held = Math.max(held, Math.abs(prev[i]));
+        let held = 0; for (let i = 0; i < n; i++) held = Math.max(held, Math.abs(prev[i]), fromZero ? Math.abs(prev[i] - live[i]) : 0);
         if (held > eps) { u = 0; for (let i = 0; i < n; i++) { const d = prev[i] - live[i], v = vel[i] * T; d0[i] = d; v0[i] = d >= 0 ? clamp(v, -3 * d, out * d) : clamp(v, out * d, -3 * d); } }
         else u = Infinity;
       }
@@ -1375,6 +1392,12 @@ function nodCurve(u, up, down) {
 }
 // minimum-jerk step 0..1 (saccade profile)
 const mjerk = u => (u <= 0 ? 0 : u >= 1 ? 1 : u * u * u * (10 - 15 * u + 6 * u * u));
+// one step of a critically damped follower s = { x, v } toward u held over dt, time constant T (spikes/lf_motion): exact for any dt (frame-rate independent)
+function cdStep(s, u, dt, T) {
+  if (!(dt > 0)) return s.x; if (!(T > 0)) { s.x = u; s.v = 0; return u; }
+  const w = 1 / T, d = s.x - u, c = s.v + w * d, e = Math.exp(-w * dt); s.x = u + (d + c * dt) * e; s.v = (s.v - w * c * dt) * e;
+  if (Math.abs(s.x - u) < 1e-9 && Math.abs(s.v) < 1e-8) { s.x = u; s.v = 0; } return s.x;
+}
 // words of a clip from character timings ({char, start, end}): [{ text, start, end, stress (1 content word, 0 function word), phrase, phraseStart }]
 // a phrase starts at the first word, after , . ; : ! ? and after a gap of 0.15 s or more
 function wordsFromTimings(timings) {
@@ -1853,19 +1876,31 @@ async function create(canvas, options = {}) {
     live.on = on; live.src = source; live.mt = mt; speechCut = false; return cut;
   }
   function stepIdle(dt, cut) {
-    const I = preset.idle, S = preset.speech, id = idle, speaking = speakingNow(); id.t += dt; const t = id.t;
+    const I = preset.idle, S = preset.speech, id = idle, speaking = speakingNow(); id.t += dt; const t = id.t, MO = moOn();
     if (!I.enabled) { id.off[0] = id.off[1] = 0; relPitch.reset(); return; }
-    // head sway: a slow random walk inside the rig's limits, eased between targets
+    // head sway: a slow random walk inside the rig's limits, eased between targets (motion.swaySpline: a C1 spline through them, the head never stops)
     const sw = I.sway; let oy = 0, op_ = 0;
     if (sw.enabled && limits && (!speaking || S.swayWhileSpeaking)) {
-      const q = id.sway; if (t - q.t0 >= q.dur) { q.from = q.to.slice(); q.t0 = t; q.dur = rndRange(sw.periodS);
-        const ya = (sw.yawDeg + (speaking ? S.emphasisDeg : 0)) * DEG, ta = sw.tiltDeg * DEG; q.to = [rnd(-ya, ya), rnd(-ta, ta)]; }
-      const u = ss((t - q.t0) / q.dur); oy = q.from[0] + (q.to[0] - q.from[0]) * u; op_ = q.from[1] + (q.to[1] - q.from[1]) * u;
+      const q = id.sway, spl = !!(MO && MO.swaySpline), ya = (sw.yawDeg + (speaking ? S.emphasisDeg : 0)) * DEG, ta = sw.tiltDeg * DEG;
+      const draw = () => { const d = rndRange(sw.periodS); return { d, p: [rnd(-ya, ya), rnd(-ta, ta)] }; };   // the same three draws per target as before
+      if (t - q.t0 >= q.dur) {
+        const tb = q.t0 + q.dur; q.prev = q.from; q.pdur = q.dur; q.from = q.to.slice(); q.t0 = t;
+        if (spl) { const a = q.next || draw(); q.dur = a.d; q.to = a.p; q.next = draw(); if (t - tb < q.dur) q.t0 = tb; }   // spline: targets drawn one ahead (the tangent at a knot needs the next one); the segment starts at the knot's time (no one-frame pause)
+        else { const a = draw(); q.dur = a.d; q.to = a.p; q.next = null; }
+      }
+      const u = (t - q.t0) / q.dur;
+      if (spl && q.next) {                                       // Hermite through prev -> from -> to -> next, Catmull-Rom tangents for uneven segment times: C1, never stops
+        const P = q.prev || q.from, pd = q.pdur || q.dur, nd = q.next.d, N = q.next.p, h = clamp(u, 0, 1), h2 = h * h, h3 = h2 * h, a0 = 2 * h3 - 3 * h2 + 1, a1 = h3 - 2 * h2 + h, a2 = -2 * h3 + 3 * h2, a3 = h3 - h2;
+        for (let k = 0; k < 2; k++) {
+          const m0 = (q.to[k] - P[k]) / (pd + q.dur) * q.dur, m1 = (N[k] - q.from[k]) / (q.dur + nd) * q.dur, v = a0 * q.from[k] + a1 * m0 + a2 * q.to[k] + a3 * m1;
+          if (k === 0) oy = v; else op_ = v;
+        }
+      } else { const k = ss(u); oy = q.from[0] + (q.to[0] - q.from[0]) * k; op_ = q.from[1] + (q.to[1] - q.from[1]) * k; }
       const ym = limits.yaw * sw.limitFraction, pm = limits.pitch * sw.limitFraction; oy = clamp(oy, -ym, ym); op_ = clamp(op_, -pm, pm);
     }
     const BT = S.beat; pitchBuf[0] = 0;
     if (BT && BT.enabled !== false && driver && limits && source && source.playing()) { const b = driver.beat || 0, st = driver.settle || 0; pitchBuf[0] = PITCH_DOWN * ((BT.nodDeg ?? 0.9) * b + (BT.settleDeg ?? 0.6) * st) * DEG; }   // (no source: no beat; a detached timed driver kept its last value)
-    op_ += relPitch.step(dt, pitchBuf, cut || live.cut1)[0]; live.cut1 = cut;   // eases out instead of dropping to 0 when the clip ends, pauses or is replaced. The beat read here is the
+    op_ += relPitch.step(dt, pitchBuf, cut || live.cut1, !!(MO && MO.beatEaseIn))[0]; live.cut1 = cut;   // eases out instead of dropping to 0 when the clip ends, pauses or is replaced. The beat read here is the
     // driver's value from the previous frame's update, so a new clip or track reaches it one frame after the cut: the release is (re)started on both frames
     id.off[0] = oy; id.off[1] = op_;
     // gaze
@@ -1875,13 +1910,15 @@ async function create(canvas, options = {}) {
       if (g.mode === "sine") { id.gazeVal[0] = rx + g.amount * Math.sin(t * (0.37 + 0.21 * gi.x) + gi.x); id.gazeVal[1] = ry + g.amount * Math.sin(t * (0.37 + 0.21 * gi.y) + gi.y); }
       else {
         const av = g.aversion || {}, avOn = av.enabled && (!speaking || S.aversionsWhileSpeaking);
-        const retarget = (tx, ty, dur) => { const k = ss((t - q.t0) / q.dur); q.from = [q.from[0] + (q.to[0] - q.from[0]) * k, q.from[1] + (q.to[1] - q.from[1]) * k]; q.to = [tx, ty]; q.t0 = t; q.dur = dur; };
+        const prof = q.prof || ss, sac = !!(MO && MO.idleSaccade);       // motion.idleSaccade: minimum jerk over the main-sequence time (the drawn shiftS is still drawn: same random stream)
+        const retarget = (tx, ty, dur) => { const k = prof((t - q.t0) / q.dur); q.from = [q.from[0] + (q.to[0] - q.from[0]) * k, q.from[1] + (q.to[1] - q.from[1]) * k]; q.to = [tx, ty]; q.t0 = t; q.dur = dur;
+          if (sac) { const E = eyesCfg(), amp = Math.hypot((tx - q.from[0]) * cal.x, (ty - q.from[1]) * cal.y); q.dur = Math.max(dt, (E.saccadeMs[0] + E.saccadeMs[1] * amp) / 1000); q.prof = mjerk; } else q.prof = ss; };
         const bb = idle.blink.busy();                                    // a blink is running (only a rig with a blink control): the gaze jump waits for it
         if (bb) { /* hold the gaze where it is until the blink is over */ }
         else if (q.aversion && t >= q.aversion.until) { q.aversion = null; retarget(0, 0, rndRange(g.shiftS)); q.next = t + rndRange(g.intervalS); q.nextAversion = t + rndRange(speaking ? av.everySpeakingS || [4, 8] : av.everyListeningS || [8, 15]); }
         else if (!q.aversion && avOn && t >= q.nextAversion) { const sx = Math.random() < 0.5 ? -1 : 1; q.aversion = { until: t + rndRange(av.durationS || [1, 3]) }; retarget(sx * av.amount, -Math.abs(av.amount) * 0.5, rndRange(g.shiftS)); }
         else if (!q.aversion && t >= q.next) { retarget(rnd(-1, 1) * g.amount, rnd(-1, 1) * g.amount * 0.6, rndRange(g.shiftS)); q.next = t + rndRange(g.intervalS); }
-        const k = ss((t - q.t0) / q.dur); id.gazeVal[0] = rx + q.from[0] + (q.to[0] - q.from[0]) * k; id.gazeVal[1] = ry + q.from[1] + (q.to[1] - q.from[1]) * k;
+        const k = (q.prof || ss)((t - q.t0) / q.dur); id.gazeVal[0] = rx + q.from[0] + (q.to[0] - q.from[0]) * k; id.gazeVal[1] = ry + q.from[1] + (q.to[1] - q.from[1]) * k;
       }
     } else if (gi.x >= 0 && gi.y >= 0) { id.gazeVal[0] = rig.rest ? rig.rest[gi.x] : 0; id.gazeVal[1] = rig.rest ? rig.rest[gi.y] : 0; }
   }
@@ -1895,6 +1932,16 @@ async function create(canvas, options = {}) {
   // Nothing here runs unless a page adds a layer, sets a gaze target, calls nod / tilt / lean / blink, or turns preset.idle.eyes on: M.on, EY.on stay false
   // and the pose, the weights and the picture are those of the viewer before (tests/viewer/lifelike.test.mjs).
   const layers = [];
+  const moOn = () => (preset.motion && preset.motion.enabled !== false ? preset.motion : null);   // motion (spikes/lf_motion): null = the old motion exactly
+  // the layers' summed outputs before the motion filter (LS) and the filter's followers (LF): pose 0..3 = yaw, pitch, roll, zoom; one per control
+  const LS = { p: new Float64Array(4), c: new Float32Array(Math.max(ctlInfo.length, 1)), con: new Uint8Array(Math.max(ctlInfo.length, 1)) };
+  const LF = { p: [0, 1, 2, 3].map(() => ({ x: 0, v: 0 })), c: ctlInfo.map(() => ({ x: 0, v: 0 })), cls: null, clsKey: "" };
+  function ctlClasses(MO) {                                       // per control: 0 = unfiltered (speech shapes but smile, gaze, raw), 1 = expression, 2 = mouth-opening expression
+    const key = JSON.stringify([MO.raw || [], MO.mouthExpr || []]); if (LF.cls && LF.clsKey === key) return LF.cls;
+    LF.clsKey = key; LF.cls = ctlInfo.map((c, j) => ((j < Ks && c.name !== "smile") || c.name === "gazeX" || c.name === "gazeY" || (MO.raw || []).includes(c.name) ? 0 : (MO.mouthExpr || []).includes(c.name) ? 2 : 1));
+    return LF.cls;
+  }
+  const lfRest = s => s.x === 0 && s.v === 0;
   const M = { on: false, yaw: 0, pitch: 0, roll: 0, zoom: 0, nodPitch: 0, nodPivot: 0, ctl: new Float32Array(Math.max(ctlInfo.length, 1)), ctlOn: false, gaze: null };
   const spring = T => ({ x: 0, v: 0, to: 0, T });
   function stepSpring(s, dt) {                                    // critically damped, exact for any dt; settles in about s.T
@@ -1941,6 +1988,8 @@ async function create(canvas, options = {}) {
     for (const [sp, key] of [[prim.tilt, "roll"], [prim.lean, "zoom"], [prim.hy, "yaw"], [prim.hp, "pitch"]]) {
       if (sp.x === 0 && sp.v === 0 && sp.to === 0 && !sp.g) continue; stepSpring(sp, dt); M[key] += sp.x; any = true;
     }
+    const MO = moOn(), F = MO ? LS : null;                       // motion on: the layers' sums go through the followers below first
+    if (F) { F.p.fill(0); F.c.fill(0); F.con.fill(0); }
     if (layers.length) {
       const dw = {}; for (let j = 0; j < Ks; j++) dw[controlNames[j]] = rigW[j];
       const ctx = { t, dt, speaking: speakingNow(), driverWeights: dw, pose: api.pose, state: lifeState() };
@@ -1948,12 +1997,25 @@ async function create(canvas, options = {}) {
       for (const fn of layers.slice()) {
         let r; try { r = fn(ctx); } catch (e) { console.error("OpenAvatar layer:", e); continue; }
         if (!r || typeof r !== "object") continue;
-        M.yaw += num(r.yaw) + num(r.yawDeg) * DEG; M.pitch += num(r.pitch) + num(r.pitchDeg) * DEG; M.roll += num(r.roll) + num(r.rollDeg) * DEG; M.zoom += num(r.zoom);
-        if (isObj(r.controls)) for (const k of Object.keys(r.controls)) { const j = ctlIndex(k), v = +r.controls[k]; if (j >= 0 && Number.isFinite(v) && v !== 0) { M.ctl[j] += v; M.ctlOn = true; } }   // unknown names: ignored
+        const ly = num(r.yaw) + num(r.yawDeg) * DEG, lp = num(r.pitch) + num(r.pitchDeg) * DEG, lr = num(r.roll) + num(r.rollDeg) * DEG, lz = num(r.zoom);
+        if (F) { F.p[0] += ly; F.p[1] += lp; F.p[2] += lr; F.p[3] += lz; } else { M.yaw += ly; M.pitch += lp; M.roll += lr; M.zoom += lz; }
+        if (isObj(r.controls)) for (const k of Object.keys(r.controls)) { const j = ctlIndex(k), v = +r.controls[k]; if (j >= 0 && Number.isFinite(v) && v !== 0) { if (F) { F.c[j] += v; F.con[j] = 1; } else { M.ctl[j] += v; M.ctlOn = true; } } }   // unknown names: ignored
         if (r.gaze === "camera") M.gaze = [0, 0]; else if (r.gaze && Number.isFinite(+r.gaze.x) && Number.isFinite(+r.gaze.y)) M.gaze = [+r.gaze.x, +r.gaze.y];
         if (r.blinkNow) api.blink(typeof r.blinkNow === "string" ? { kind: r.blinkNow } : isObj(r.blinkNow) ? r.blinkNow : {});
       }
     }
+    if (F) {                                                     // the motion filter: critically damped followers (cdStep); a removed layer fades out instead of dropping
+      const Tp = +MO.poseS || 0, Te = +MO.exprS || 0, Tm = Array.isArray(MO.mouthExprS) ? MO.mouthExprS : [Te, Te], cls = ctlClasses(MO);
+      for (let k = 0; k < 4; k++) { const s = LF.p[k], u = F.p[k]; if (u === 0 && lfRest(s)) continue; const x = cdStep(s, u, dt, Tp); any = true;
+        if (k === 0) M.yaw += x; else if (k === 1) M.pitch += x; else if (k === 2) M.roll += x; else M.zoom += x; }
+      for (let j = 0; j < LF.c.length; j++) {
+        const u = F.c[j], s = LF.c[j], c = cls[j];
+        if (c === 0) { if (F.con[j]) { M.ctl[j] += u; M.ctlOn = true; } s.x = s.v = 0; continue; }
+        if (u === 0 && lfRest(s)) continue;
+        const x = cdStep(s, u, dt, c === 2 ? (u > s.x ? +Tm[0] || 0 : +Tm[1] || 0) : Te); any = true;
+        if (x !== 0) { M.ctl[j] += x; M.ctlOn = true; }
+      }
+    } else { for (const s of LF.p) s.x = s.v = 0; for (const s of LF.c) s.x = s.v = 0; }
     M.on = any;
   }
   function lifeState() {
@@ -1970,13 +2032,18 @@ async function create(canvas, options = {}) {
     if (eyesOn) {
       const H = headDeg(E), q = idle.gaze, T = tgt ? tgt.slice() : [q.to[0] * cal.x, q.to[1] * cal.y];
       if (!EY.on) {                                               // start from where the eyes are now (world = eye-in-head + head)
-        EY.on = true; const ex = (rigW[gi.x] - restOf(gi.x)) * cal.x, ey = (rigW[gi.y] - restOf(gi.y)) * cal.y; EY.fix = [ex + H[0], ey + H[1]]; EY.goal = null; EY.t0 = -9; EY.mic = [0, 0]; EY.mT0 = -9; EY.nextMicro = t + 0.3;
+        EY.on = true; const ex = (rigW[gi.x] - restOf(gi.x)) * cal.x, ey = (rigW[gi.y] - restOf(gi.y)) * cal.y; EY.fix = [ex + H[0], ey + H[1]]; EY.goal = null; EY.pv = null; EY.t0 = -9; EY.mic = [0, 0]; EY.mT0 = -9; EY.nextMicro = t + 0.3;
       }
       if (!EY.goal || Math.hypot(T[0] - EY.goal[0], T[1] - EY.goal[1]) >= E.saccadeMinDeg) { EY.goal = T.slice(); startSaccade(T, t, E); }
       else { EY.goal = T.slice(); }
-      if (t - EY.t0 < EY.dur) { const k = mjerk((t - EY.t0) / EY.dur); EY.fix = [EY.from[0] + (EY.to[0] - EY.from[0]) * k, EY.from[1] + (EY.to[1] - EY.from[1]) * k]; }
-      else if (!EY.landed) { EY.landed = true; EY.fix = EY.to.slice(); }   // the saccade lands exactly
-      else { const a = dt > 0 ? 1 - Math.exp(-dt / Math.max(0.01, E.pursuitS)) : 0; EY.fix = [EY.fix[0] + (EY.goal[0] - EY.fix[0]) * a, EY.fix[1] + (EY.goal[1] - EY.fix[1]) * a]; }   // pursuit of a slowly moving target
+      const MOe = moOn(), p2 = !!(MOe && MOe.pursuitOrder2);
+      if (t - EY.t0 < EY.dur) { const k = mjerk((t - EY.t0) / EY.dur); EY.fix = [EY.from[0] + (EY.to[0] - EY.from[0]) * k, EY.from[1] + (EY.to[1] - EY.from[1]) * k]; EY.pv = null; }
+      else if (!EY.landed) { EY.landed = true; EY.fix = EY.to.slice(); EY.pv = null; }   // the saccade lands exactly
+      else if (p2) {                                              // pursuit (motion.pursuitOrder2): critically damped, T = pursuitS / 2 (the same lag on a ramp, no velocity step when the target starts to move)
+        if (!EY.pv) EY.pv = [{ x: EY.fix[0], v: 0 }, { x: EY.fix[1], v: 0 }];
+        const Tq = Math.max(0.005, E.pursuitS / 2); EY.fix = [cdStep(EY.pv[0], EY.goal[0], dt, Tq), cdStep(EY.pv[1], EY.goal[1], dt, Tq)];
+      }
+      else { const a = dt > 0 ? 1 - Math.exp(-dt / Math.max(0.01, E.pursuitS)) : 0; EY.fix = [EY.fix[0] + (EY.goal[0] - EY.fix[0]) * a, EY.fix[1] + (EY.goal[1] - EY.fix[1]) * a]; EY.pv = null; }   // pursuit of a slowly moving target
       const mc = E.micro || {};                                   // microsaccades: 1-2 / s, under maxDeg, pulled back toward the fixation
       if (mc.enabled && t - EY.t0 > EY.dur && t >= EY.nextMicro) {
         const r = (mc.maxDeg ?? 0.4) * (0.3 + 0.7 * Math.random()), a = Math.random() * 2 * Math.PI, to = [-0.5 * EY.mic[0] + r * Math.cos(a), -0.5 * EY.mic[1] + r * Math.sin(a)], l = Math.hypot(to[0], to[1]), mx = mc.maxDeg ?? 0.4;
@@ -2003,7 +2070,12 @@ async function create(canvas, options = {}) {
     if (uy !== null && !("gazeY" in manual)) rigW[gi.y] = restOf(gi.y) + (clampG(uy, gi.y) - restOf(gi.y)) * g;
     const bd = +B.browDip || 0, bu = ctlIndex("browUp");             // ...and the brows dip a touch (only a model with a browUp control)
     if (bd > 0 && bv > 0 && bu >= 0 && !("browUp" in manual)) rigW[bu] = Math.max(ctlInfo[bu].min, rigW[bu] - bd * bv);
-    if (M.ctlOn) for (let j = 0; j < ctlInfo.length; j++) { if (M.ctl[j] === 0 || controlNames[j] in manual) continue; const c = ctlInfo[j]; rigW[j] = clamp(rigW[j] + M.ctl[j], c.min, c.max); }
+    const MO = moOn(), soft = !!(MO && MO.softLimit), cls = MO ? ctlClasses(MO) : null;   // motion.softLimit: expression deltas ease into the range (softLimit, as the pose) instead of clipping flat
+    const pi = ctlIndex("press"), gate = MO && MO.closureGate && pi >= 0 ? 1 - ss(rigW[pi] / 0.5) : 1;   // motion.closureGate
+    const bg = MO && Array.isArray(MO.blinkGate) && MO.blinkGate.length && bv > 0 ? 1 - ss(bv / 0.8) : 1;   // motion.blinkGate (bv: the blink before layer deltas)
+    if (M.ctlOn) for (let j = 0; j < ctlInfo.length; j++) { if (M.ctl[j] === 0 || controlNames[j] in manual) continue; const c = ctlInfo[j]; if (gate < 1 && cls[j] === 2 && M.ctl[j] > 0) M.ctl[j] *= gate;
+      if (bg < 1 && M.ctl[j] > 0 && MO.blinkGate.includes(c.name)) M.ctl[j] *= bg; const b0 = rigW[j];
+      rigW[j] = soft && cls[j] !== 0 && b0 >= c.min && b0 <= c.max ? b0 + softLimit(M.ctl[j], c.min - b0, c.max - b0) : clamp(b0 + M.ctl[j], c.min, c.max); }
   }
   // speech events: speechstart / speechend (an utterance: the first opening of a clip .. its track's end, the clip stopping, or 1 s of quiet without a track),
   // word / phrase (timed tracks: words from the character timings or data.words, at their start in the clip's time + driver.lead; loudness: phrase only)
@@ -2112,8 +2184,17 @@ async function create(canvas, options = {}) {
     frameCount++; if (now - fpsT > 1000) { fps = frameCount * 1000 / (now - fpsT); frameCount = 0; fpsT = now; }
     info.fps = fps; info.visible = count; emit("frame", info);
   }
+  // eased base pose (spikes/lf_motion): setPose(p, { easeS }) moves the base pose to p through a critically damped follower (drags, a reset); a plain setPose sets at once
+  const BE = { on: false, T: 0.03, tgt: {}, e: {} };
+  const wrapA = a => Math.atan2(Math.sin(a), Math.cos(a));
+  function stepBaseEase(dt) {
+    if (!BE.on) return; let live = false;
+    for (const k of Object.keys(BE.tgt)) { const s = BE.e[k]; cdStep(s, 0, dt, BE.T); base[k] = BE.tgt[k] + s.x; if (s.x === 0 && s.v === 0) { delete BE.tgt[k]; delete BE.e[k]; } else live = true; }
+    BE.on = live; if (!live) BE.tgt = {};
+  }
+  const poseTgt = k => (BE.on && k in BE.tgt ? BE.tgt[k] : base[k]);   // where the base pose is going (pointer drags add to it)
   function renderFrame(dt, now, exact) {
-    const tc0 = performance.now(); if (hasRig) computeWeights(dt);
+    const tc0 = performance.now(); stepBaseEase(dt); if (hasRig) computeWeights(dt);
     if (orb) { const g = followTarget(); if (orb.gainP !== g) orb.gainP = orb.easeS > 0 ? (g > orb.gainP ? Math.min(g, orb.gainP + dt / orb.easeS) : Math.max(g, orb.gainP - dt / orb.easeS)) : g; }   // head-follow eases in and out
     applyPose();
     if (hasRig && named) lifeAfterPose(dt);
@@ -2153,6 +2234,7 @@ async function create(canvas, options = {}) {
     const dt = lastNow ? Math.min(0.25, (now - lastNow) / 1000) : 0; lastNow = now;
     if (!named) { phase += dt; const per = D.frames / D.fps; if (phase >= per) phase -= per; dirty = true; }   // plain clip models loop their stored motion
     if (named && (preset.idle.enabled || driver || layers.length || M.on || EY.on || EY.off || gazeTarget || idle.blink.pending())) dirty = true;
+    if (BE.on) dirty = true;
     if (orb && orb.gainP !== followTarget()) dirty = true;
     if (!dirty) return; dirty = false; renderFrame(dt, now, false);
   }
@@ -2180,7 +2262,15 @@ async function create(canvas, options = {}) {
     // setFollowHead acts at once as it always did, unless `ease` is true (a checkbox on a live page).
     setFollowHead(on, ease) { if (orb) { orb.follow = !!on; if (!ease) orb.gainP = followTarget(); applyPose(); dirty = true; } return !!orb && orb.follow; },
     setAutoOrbit(on, now) { if (orb) { orb.auto = !!on; if (now) orb.gainP = followTarget(); applyPose(); dirty = true; } return !!orb && orb.auto; },
-    setPose(p) { if (p.yaw !== undefined) base.yaw = +p.yaw; if (p.pitch !== undefined) base.pitch = +p.pitch; if (p.zoom !== undefined) base.zoom = clamp(+p.zoom, 0.25, 2.5); if (p.orbit !== undefined && orbitOn) base.orbit = +p.orbit; if (p.roll !== undefined && Number.isFinite(+p.roll)) base.roll = +p.roll; applyPose(); dirty = true; return api.pose; },
+    // o.easeS (spikes/lf_motion, with preset.motion on): go there through a critically damped follower with this time constant instead of at once (a drag, a reset button)
+    setPose(p, o) {
+      const ease = o && +o.easeS > 0 && moOn() ? +o.easeS : 0, set = (k, val) => {
+        if (!ease) { base[k] = val; if (k in BE.tgt) { delete BE.tgt[k]; delete BE.e[k]; } return; }
+        const s = BE.e[k] || (BE.e[k] = { x: 0, v: 0 }); s.x = k === "orbit" && orbitFull ? wrapA(base[k] - val) : base[k] - val; BE.tgt[k] = val; BE.T = ease; BE.on = true;   // keeps the shown pose and its speed
+      };
+      if (p.yaw !== undefined) set("yaw", +p.yaw); if (p.pitch !== undefined) set("pitch", +p.pitch); if (p.zoom !== undefined) set("zoom", clamp(+p.zoom, 0.25, 2.5)); if (p.orbit !== undefined && orbitOn) set("orbit", +p.orbit); if (p.roll !== undefined && Number.isFinite(+p.roll)) set("roll", +p.roll);
+      applyPose(); dirty = true; return api.pose;
+    },
     getPreset() { return JSON.parse(JSON.stringify(preset)); },
     // render options (RENDER_DEFAULTS): merged onto the current ones; null turns catchlights / post off; quadExtent is fixed at create
     setRender(o) { RS = readRender(RS, o || {}); lastSig = null; dirty = true; return api.getRender(); },
@@ -2232,10 +2322,14 @@ async function create(canvas, options = {}) {
       const down = e => { canvas.setPointerCapture(e.pointerId); ptr.set(e.pointerId, [e.clientX, e.clientY]); if (ptr.size === 2) { const [a, b] = [...ptr.values()]; pinch = Math.hypot(a[0] - b[0], a[1] - b[1]); } };
       const move = e => {
         if (!ptr.has(e.pointerId)) return; const p = ptr.get(e.pointerId), dx = e.clientX - p[0], dy = e.clientY - p[1]; ptr.set(e.pointerId, [e.clientX, e.clientY]);
-        if (ptr.size === 1) { if (orbitOn) api.setPose({ orbit: base.orbit - dx * 0.008, pitch: clamp(base.pitch + dy * 0.004, -0.5, 0.5) }); else api.setPose({ yaw: base.yaw - dx * 0.006, pitch: clamp(base.pitch + dy * 0.004, -1, 1) }); }
-        else if (ptr.size === 2) { const [a, b] = [...ptr.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]); if (pinch) api.setPose({ zoom: base.zoom * pinch / d }); pinch = d; }
+        const MO = moOn(), eo = MO && +MO.pointerS > 0 ? { easeS: +MO.pointerS } : undefined;   // motion.pointerS: the drag eases (from where it is going, so no drag distance is lost)
+        if (ptr.size === 1) {
+          if (orbitOn) { let o2 = poseTgt("orbit") - dx * 0.008; if (eo && !orbitFull) o2 = clamp(o2, orb.min, orb.max); api.setPose({ orbit: o2, pitch: clamp(poseTgt("pitch") + dy * 0.004, -0.5, 0.5) }, eo); }
+          else { let y2 = poseTgt("yaw") - dx * 0.006, p2 = clamp(poseTgt("pitch") + dy * 0.004, -1, 1); if (eo) [y2, p2] = clampAngles(y2, p2); api.setPose({ yaw: y2, pitch: p2 }, eo); }
+        }
+        else if (ptr.size === 2) { const [a, b] = [...ptr.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]); if (pinch) api.setPose({ zoom: poseTgt("zoom") * pinch / d }, eo); pinch = d; }
       };
-      const up = e => { ptr.delete(e.pointerId); pinch = 0; }, wheel = e => { e.preventDefault(); api.setPose({ zoom: base.zoom * Math.exp(e.deltaY * 0.001) }); };
+      const up = e => { ptr.delete(e.pointerId); pinch = 0; }, wheel = e => { e.preventDefault(); const MO = moOn(); api.setPose({ zoom: poseTgt("zoom") * Math.exp(e.deltaY * 0.001) }, MO && +MO.pointerS > 0 ? { easeS: 2 * MO.pointerS } : undefined); };
       canvas.addEventListener("pointerdown", down); canvas.addEventListener("pointermove", move); canvas.addEventListener("pointerup", up); canvas.addEventListener("pointercancel", up); canvas.addEventListener("wheel", wheel, { passive: false });
       const off = () => { canvas.removeEventListener("pointerdown", down); canvas.removeEventListener("pointermove", move); canvas.removeEventListener("pointerup", up); canvas.removeEventListener("pointercancel", up); canvas.removeEventListener("wheel", wheel); };
       disposers.push(off); return off;
