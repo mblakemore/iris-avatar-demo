@@ -55,7 +55,7 @@
   <div id="cap" aria-live="off" hidden></div>
   <div id="note" hidden></div>
   <div id="bar">
-    <div class="row"><button id="play">Hear her speak</button><button id="play2">Hear a story</button><button id="reset">Reset view</button></div>
+    <div class="row"><button id="play">Hear her speak</button><button id="play2">Show me what you can do</button><button id="reset">Reset view</button></div>
   </div>
 </div>
 <audio id="aud" preload="auto"></audio>
@@ -80,8 +80,24 @@ try {
   const CLIPS = {
     hello: { audio: "sample.mp3", json: "sample.json",
       tagged: "Hello, [smile] I'm Iris. Drag to turn my head, scroll to zoom, and click the button [brow] whenever you'd like to hear me speak. [smile]" },
-    story: { audio: "sample2.mp3", json: "sample2.json", mood: { valence: 0.15, arousal: 0.6, engagement: 0.85 },
-      tagged: "[curious] Can I tell you something? This morning, someone asked me to describe a sunset to a person who'd never seen one. [hmm] Hmm. So I said, it's like the whole sky slowly... [smile] blushing. [laugh] And they laughed at me! Which, honestly, fair enough. [grin] But then they went quiet, [concern] and told me their grandmother used to watch the sunset with them, every single evening. [sad] I didn't know what to say. So I just listened. [warm] And sometimes, that's the best thing anyone can do. [smile] Anyway! [surprise] Enough about me. [brow] What made you smile today? [warm]" },
+    // "Show me what you can do": a guided tour, each move timed on her words (seconds into the clip)
+    story: { audio: "sample2.mp3", json: "sample2.json", mood: { valence: 0.35, arousal: 0.6, engagement: 0.85 }, tagged: "",
+      tour: [
+        [3.45, () => { turn(20, 0); look(14, 0); }], [5.0, () => look(null)], [5.65, () => turn(0, 0)],                                      // "turn my head to the side... and back to you"
+        [7.35, () => look(0, 14, 3)], [9.3, () => look(0, -12, -3)], [10.6, () => look(null)],  // "look up... and down"
+        [11.85, () => { cue("surprise", 1, 1.9); cue("wide", 1, 1.9); }],                          // "open my eyes wide! Like this!"
+        [14.55, () => cue("brow", 1, 1.5)],                                                       // "raise my eyebrows..."
+        [15.85, () => cue("frown", 1, 1.9)],                                                      // "or frown"
+        [18.35, () => { cue("hmm", 1, 1.6); cue("thinks", 1, 1.4); }],                            // "Hmm..."
+        [19.85, () => { b.setMood({ valence: -0.9, arousal: 0.3, engagement: 0.7 }); cue("sad", 1, 2.6); }],   // "a little sad. Like this."
+        [22.6, () => { b.setMood(CLIPS.story.mood); cue("warm", 0.8, 1.2); }],
+        [23.35, () => cue("smile", 1, 1.0)],                                                      // "rather smile."
+        [24.15, () => cue("laugh", 1, 2.4)],                                                      // (laughs) "And I can laugh!"
+        [26.8, () => cue("nod", 1)], [27.55, () => cue("nod", 0.7)],                              // "nod... yes"
+        [28.95, () => cue("shake", 1)],                                                           // "shake my head... no"
+        [31.3, () => v.blink({ kind: "long" })], [31.9, () => cue("smile", 0.6, 1.2)],            // "blink, slowly"
+        [33.3, () => cue("warm", 1, 2.6)],                                                        // "Thanks for watching!"
+      ] },
   };
   await OpenAvatarViewer.loadLexicon();
   const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
@@ -121,6 +137,20 @@ try {
   const NAMES = { idle: "idle", listening: "idle", thinking: "thinking", speaking: "speaking", yielding: "your turn" };
   b.on("state", e => { const s = e && e.state; $("state").hidden = false; $("state").textContent = NAMES[s] || s; });
 
+  // the tour's own moves: a head turn layer, gaze targets and expression cues fired on the clip's clock
+  const cue = (name, strength, dur) => b.cue(name, dur ? { strength, dur } : { strength });
+  const head = { y: 0, p: 0, ty: 0, tp: 0 }; let headT = performance.now();
+  const turn = (yawDeg, pitchDeg) => { head.ty = yawDeg; head.tp = pitchDeg; };
+  let gazeAt = null;                                       // returned by this layer, which runs after the behaviour's, so it wins while set
+  const look = (x, y, pitchDeg = 0) => { gazeAt = x === null ? null : { x, y }; head.tp = x === null ? 0 : pitchDeg; };
+  v.addLayer(() => {
+    const now = performance.now(), dt = Math.min(0.1, (now - headT) / 1000), k = 1 - Math.exp(-dt / 0.28); headT = now;
+    if (playing && cur.tour && !a.paused) { while (cur.tourAt < cur.tour.length && a.currentTime >= cur.tour[cur.tourAt][0]) cur.tour[cur.tourAt++][1](); }
+    head.y += (head.ty - head.y) * k; head.p += (head.tp - head.p) * k;
+    return gazeAt ? { yawDeg: head.y, pitchDeg: head.p, gaze: gazeAt } : { yawDeg: head.y, pitchDeg: head.p };
+  });
+  const tourReset = () => { head.ty = 0; head.tp = 0; gazeAt = null; };
+
   // captions: the line's words, highlighted as she says each one
   // long lines show one sentence at a time, so the caption never covers her face
   const showCap = () => {
@@ -133,14 +163,14 @@ try {
   });
   const capDone = () => { clearTimeout(capDone.h); capDone.h = setTimeout(() => { $("cap").hidden = true; }, 1800); };
 
-  const BTN = { hello: ["play", "Hear her speak"], story: ["play2", "Hear a story"] };
+  const BTN = { hello: ["play", "Hear her speak"], story: ["play2", "Show me what you can do"] };
   let pending = 0, playing = null;
   const label = () => { for (const k in BTN) $(BTN[k][0]).textContent = (playing === k && (!a.paused || pending)) ? "Stop" : BTN[k][1]; };
-  const stop = () => { clearTimeout(pending); pending = 0; if (!a.paused) a.pause(); b.yield(); b.setMood(REST_MOOD); playing = null; label(); };
+  const stop = () => { clearTimeout(pending); pending = 0; if (!a.paused) a.pause(); b.yield(); b.setMood(REST_MOOD); tourReset(); playing = null; label(); };
   const toggle = async (k = "hello") => {
     if (!a.paused || pending) { const same = playing === k; stop(); if (same) return; }
     const C = await loadClip(k);
-    use(C); playing = k;
+    use(C); playing = k; C.tourAt = 0; tourReset();
     clearTimeout(capDone.h); showCap();
     if (C.mood) b.setMood(C.mood);
     b.think();                                             // a short "thinking" beat: a glance away and an in-breath before she answers
@@ -153,7 +183,7 @@ try {
     label();
   };
   a.addEventListener("play", label); a.addEventListener("pause", label);
-  a.addEventListener("ended", () => { playing = null; b.setMood(REST_MOOD); label(); capDone(); });
+  a.addEventListener("ended", () => { playing = null; b.setMood(REST_MOOD); tourReset(); label(); capDone(); });
   $("play").onclick = () => toggle("hello");
   $("play2").onclick = () => toggle("story");
 
