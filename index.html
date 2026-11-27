@@ -30,7 +30,7 @@
   button:hover, button:focus-visible { border-color: var(--acc); outline: none; }
   button.chip { font-size: 13px; padding: 5px 11px; }
   button[aria-pressed="true"] { border-color: var(--acc); color: var(--acc); }
-  #play { background: var(--acc); border-color: var(--acc); color: #10131c; font-weight: 600; }
+  #play, #play2 { background: var(--acc); border-color: var(--acc); color: #10131c; font-weight: 600; }
   #msg { position: fixed; inset: 0; display: grid; place-items: center; color: var(--mut); pointer-events: none; text-align: center; padding: 0 24px; }
   #note { font-size: 12.5px; color: var(--mut); text-align: center; pointer-events: none; }
   #info { position: fixed; right: max(16px, env(safe-area-inset-right, 0px)); top: calc(16px + env(safe-area-inset-top, 0px)); color: var(--mut); font-size: 12px; line-height: 1.6; pointer-events: none; font-variant-numeric: tabular-nums; text-align: right; }
@@ -55,10 +55,10 @@
   <div id="cap" aria-live="off" hidden></div>
   <div id="note" hidden></div>
   <div id="bar">
-    <div class="row"><button id="play">Hear her speak</button><button id="reset">Reset view</button></div>
+    <div class="row"><button id="play">Hear her speak</button><button id="play2">Hear a story</button><button id="reset">Reset view</button></div>
   </div>
 </div>
-<audio id="aud" src="sample.mp3" preload="auto"></audio>
+<audio id="aud" preload="auto"></audio>
 <script type="module">
 import { OpenAvatarViewer } from "./openavatar-viewer.js";
 import { createBehaviour, parseTags, anchorCues } from "./openavatar-behaviour.js";
@@ -75,13 +75,42 @@ try {
   $("msg").hidden = true; $("dock").hidden = false;
   const a = $("aud");
 
-  // speech: timed lip sync from the line's character timings (falls back to loudness)
-  let line = null;
-  try { line = await (await fetch("sample.json")).json(); } catch {}
+  // two recorded lines, each with its character timings (lip sync) and the same text written with expression tags, as an LLM would write it
+  // ([smile], [laugh], [concern], ...): the tags are stripped from the text and timed on its words
+  const CLIPS = {
+    hello: { audio: "sample.mp3", json: "sample.json",
+      tagged: "Hello, [smile] I'm Iris. Drag to turn my head, scroll to zoom, and click the button [brow] whenever you'd like to hear me speak. [smile]" },
+    story: { audio: "sample2.mp3", json: "sample2.json", mood: { valence: 0.15, arousal: 0.6, engagement: 0.85 },
+      tagged: "[curious] Can I tell you something? This morning, someone asked me to describe a sunset to a person who'd never seen one. [hmm] Hmm. So I said, it's like the whole sky slowly... [smile] blushing. [laugh] And they laughed at me! Which, honestly, fair enough. [grin] But then they went quiet, [concern] and told me their grandmother used to watch the sunset with them, every single evening. [sad] I didn't know what to say. So I just listened. [warm] And sometimes, that's the best thing anyone can do. [smile] Anyway! [surprise] Enough about me. [brow] What made you smile today? [warm]" },
+  };
   await OpenAvatarViewer.loadLexicon();
-  const timings = line && line.timings;
-  if (timings) { v.attachAudio(a, { driver: "timed" }); v.setDriver("timed", { timings }); v.setTrack({ timings }); }
-  else v.attachAudio(a, { driver: "loudness" });
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const loadClip = async k => {
+    const C = CLIPS[k]; if (C.ready) return C.ready;
+    return C.ready = (async () => {
+      try { C.line = await (await fetch(C.json)).json(); } catch { C.line = null; }
+      C.timings = C.line && C.line.timings;
+      C.cues = []; if (C.timings) { const P = parseTags(C.tagged); if (P.text === C.line.text) C.cues = anchorCues(P.tags, C.timings); }
+      const words = C.timings ? OpenAvatarViewer.wordsFromTimings(C.timings) : [], shown = C.line ? C.line.text.split(/\s+/) : [];
+      C.capWords = shown.length === words.length ? shown : words.map(w => w.text);
+      C.rate = 16000;
+      try {
+        const buf = await (await fetch(C.audio)).arrayBuffer(), ab = await new OAC(1, 1, C.rate).decodeAudioData(buf);
+        C.pcm = new Float32Array(ab.length); for (let c = 0; c < ab.numberOfChannels; c++) { const d = ab.getChannelData(c); for (let i = 0; i < C.pcm.length; i++) C.pcm[i] += d[i] / ab.numberOfChannels; }
+        C.rate = ab.sampleRate;
+      } catch { C.pcm = null; }
+      return C;
+    })();
+  };
+  await loadClip("hello"); loadClip("story");
+  let cur = null;
+  const use = C => {
+    if (cur === C) return; cur = C;
+    a.src = C.audio;
+    if (C.timings) { v.setDriver("timed", { timings: C.timings }); v.setTrack({ timings: C.timings }); }
+  };
+  if (CLIPS.hello.timings) v.attachAudio(a, { driver: "timed" }); else v.attachAudio(a, { driver: "loudness" });
+  use(CLIPS.hello);
 
   // life: breathing, blinks, gaze, thinking / speaking states, head motion from her voice's pitch, expression cues
   const b = createBehaviour(v, { persona: { seed: 1 } });
@@ -92,43 +121,41 @@ try {
   const NAMES = { idle: "idle", listening: "idle", thinking: "thinking", speaking: "speaking", yielding: "your turn" };
   b.on("state", e => { const s = e && e.state; $("state").hidden = false; $("state").textContent = NAMES[s] || s; });
 
-  // the line, written with expression tags as an LLM would ([smile], [brow], ...): stripped from the text and timed on its words
-  const TAGGED = "Hello, [smile] I'm Iris. Drag to turn my head, scroll to zoom, and click the button [brow] whenever you'd like to hear me speak. [smile]";
-  const words = timings ? OpenAvatarViewer.wordsFromTimings(timings) : [];
-  const shown = line ? line.text.split(/\s+/) : [];
-  let cues = [];
-  if (timings) { const P = parseTags(TAGGED); if (P.text === line.text) cues = anchorCues(P.tags, timings); }
-  const capWords = shown.length === words.length ? shown : words.map(w => w.text);
-  const showCap = () => { $("cap").innerHTML = capWords.map((w, i) => `<span data-i="${i}">${w}</span>`).join(" "); $("cap").hidden = !capWords.length; };
-  v.on("word", e => { for (const s of $("cap").querySelectorAll("span")) { const i = +s.dataset.i; s.className = i < e.index ? "said" : i === e.index ? "now" : ""; } });
+  // captions: the line's words, highlighted as she says each one
+  // long lines show one sentence at a time, so the caption never covers her face
+  const showCap = () => {
+    let sn = 0; $("cap").innerHTML = cur.capWords.map((w, i) => { const h = `<span data-i="${i}" data-s="${sn}"${sn ? " hidden" : ""}>${w}</span>`; if (/[.!?]["')]?$/.test(w)) sn++; return h; }).join(" ");
+    $("cap").hidden = !cur.capWords.length;
+  };
+  v.on("word", e => {
+    const spans = [...$("cap").querySelectorAll("span")], at = spans.find(s => +s.dataset.i === e.index), sn = at ? at.dataset.s : null;
+    for (const s of spans) { const i = +s.dataset.i; s.className = i < e.index ? "said" : i === e.index ? "now" : ""; if (sn !== null) s.hidden = s.dataset.s !== sn; }
+  });
   const capDone = () => { clearTimeout(capDone.h); capDone.h = setTimeout(() => { $("cap").hidden = true; }, 1800); };
 
-  let pcm = null, rate = 16000;
-  try {
-    const buf = await (await fetch("sample.mp3")).arrayBuffer();
-    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext, ab = await new OAC(1, 1, rate).decodeAudioData(buf);
-    pcm = new Float32Array(ab.length); for (let c = 0; c < ab.numberOfChannels; c++) { const d = ab.getChannelData(c); for (let i = 0; i < pcm.length; i++) pcm[i] += d[i] / ab.numberOfChannels; }
-    rate = ab.sampleRate;
-  } catch {}
-
-  const label = () => { $("play").textContent = a.paused && !pending ? "Hear her speak" : "Stop"; };
-  let pending = 0;
-  const stop = () => { clearTimeout(pending); pending = 0; if (!a.paused) a.pause(); b.yield(); label(); };
-  const toggle = () => {
-    if (!a.paused || pending) return stop();
+  const BTN = { hello: ["play", "Hear her speak"], story: ["play2", "Hear a story"] };
+  let pending = 0, playing = null;
+  const label = () => { for (const k in BTN) $(BTN[k][0]).textContent = (playing === k && (!a.paused || pending)) ? "Stop" : BTN[k][1]; };
+  const stop = () => { clearTimeout(pending); pending = 0; if (!a.paused) a.pause(); b.yield(); b.setMood(REST_MOOD); playing = null; label(); };
+  const toggle = async (k = "hello") => {
+    if (!a.paused || pending) { const same = playing === k; stop(); if (same) return; }
+    const C = await loadClip(k);
+    use(C); playing = k;
     clearTimeout(capDone.h); showCap();
+    if (C.mood) b.setMood(C.mood);
     b.think();                                             // a short "thinking" beat: a glance away and an in-breath before she answers
     pending = setTimeout(() => {
       pending = 0; a.currentTime = 0;
-      b.speak({ pcm: pcm || undefined, sampleRate: rate, timings: timings || undefined, cues, clock: () => a.currentTime, duration: Number.isFinite(a.duration) ? a.duration : undefined });
-      const pr = a.play(); if (pr && pr.catch) pr.catch(() => { b.yield(); label(); note("Your browser blocked the sound: press again."); });
+      b.speak({ pcm: C.pcm || undefined, sampleRate: C.rate, timings: C.timings || undefined, cues: C.cues, clock: () => a.currentTime, duration: Number.isFinite(a.duration) ? a.duration : undefined });
+      const pr = a.play(); if (pr && pr.catch) pr.catch(() => { b.yield(); playing = null; label(); note("Your browser blocked the sound: press again."); });
       label();
     }, 700);
     label();
   };
   a.addEventListener("play", label); a.addEventListener("pause", label);
-  a.addEventListener("ended", () => { label(); capDone(); });
-  $("play").onclick = toggle;
+  a.addEventListener("ended", () => { playing = null; b.setMood(REST_MOOD); label(); capDone(); });
+  $("play").onclick = () => toggle("hello");
+  $("play2").onclick = () => toggle("story");
 
   // drag to turn her head (drag up = she looks up), wheel / pinch to zoom
   const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
@@ -152,7 +179,7 @@ try {
     else if (ptr.size === 2) { const [m, n] = [...ptr.values()], d = Math.hypot(m[0] - n[0], m[1] - n[1]); if (pinch) pose({ zoom: clamp(base.zoom * pinch / d, 0.25, 2.5) }); pinch = d; }
   });
   const up = e => {
-    if (down && ptr.size === 1 && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6 && performance.now() - down.t < 400) toggle();   // a click on her plays the line
+    if (down && ptr.size === 1 && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6 && performance.now() - down.t < 400) toggle(playing || "hello");   // a click on her plays (or stops) the line
     ptr.delete(e.pointerId); pinch = 0; down = null;
   };
   c.addEventListener("pointerup", up); c.addEventListener("pointercancel", e => { ptr.delete(e.pointerId); pinch = 0; down = null; });
@@ -180,7 +207,7 @@ try {
   let hiddenAt = 0;
   document.addEventListener("visibilitychange", () => { if (document.hidden) hiddenAt = performance.now(); else if (hiddenAt && performance.now() - hiddenAt > 5000) b.noticeUser(); });
   addEventListener("keydown", e => {
-    if (e.target === document.body && e.code === "Space") { e.preventDefault(); toggle(); }
+    if (e.target === document.body && e.code === "Space") { e.preventDefault(); toggle(playing || "hello"); }
   });
 } catch (e) { $("msg").textContent = "Could not start: " + e.message; }
 </script>
