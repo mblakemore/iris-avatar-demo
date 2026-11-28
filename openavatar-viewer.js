@@ -119,8 +119,8 @@ export const DEFAULT_PRESET = {
             pointerS: 0.03 }                       // enablePointer: drags ease the pose (setPose(p, { easeS })); 0 = set at once
 };
 
-// ------------------------------------------------------------------ render options (spikes/lf_render; ROADMAP 3.4). ALL OFF BY DEFAULT: with these values a frame
-// is drawn exactly as before (same shaders' arithmetic, clear + splats). create(canvas, { render: {...} }), v.setRender({...}) or setPreset({ render: {...} }) turn them on.
+// ------------------------------------------------------------------ render options (spikes/lf_render; ROADMAP 3.4). All off by default except `detail` (lf_postfx2):
+// with { detail: false } a frame is drawn exactly as before (same shaders' arithmetic, clear + splats). create(canvas, { render: {...} }), v.setRender({...}) or setPreset({ render: {...} }) turn them on.
 export const RENDER_DEFAULTS = {
   supersample: 1,          // desktop AA: the canvas gets supersample x the device pixel ratio (the browser scales it down); 1 = off, 1.5 suggested on desktop GPUs
   maxDpr: 3,               // cap on device pixel ratio x supersample
@@ -134,7 +134,16 @@ export const RENDER_DEFAULTS = {
   splatScale: 1,           // splats drawn into a target this fraction of the canvas and scaled up (0.5 = half resolution: mobile fill rate); 1 = off
   catchlights: null,       // eye glints: true / {} = on with CATCHLIGHT_DEFAULTS, or an object overriding them
   relight: null,           // reserved (ROADMAP 4.5: not adopted, see spikes/lf_render/LOG.md)
-  post: null               // portrait finish: "portrait" (= PORTRAIT_POST) or an object { vignette, grain, plate, shadow }
+  post: null,              // portrait finish: "portrait" (= PORTRAIT_POST) or an object { vignette, grain, plate, shadow }
+  detail: true             // screen-space detail pass (spikes/lf_postfx2), ON by default: true / {} = DETAIL_DEFAULTS, or an object overriding them; null / false = off (the old look)
+};
+// The detail pass: the splats are drawn into a texture, then ONE pass resolves it to the canvas with FidelityFX CAS sharpening (MIT) and a fine mid-tone luma grain.
+// With supersample > 1 the texture is the supersampled one and the canvas stays at the device pixel ratio, so the sharpening is applied after the downscale
+// (the browser's own downscale would blur it away). With splatScale < 1 (phones) the half-size texture is first scaled up with FSR1 EASU (MIT) instead of bilinear.
+export const DETAIL_DEFAULTS = {
+  sharpen: 0.35,           // CAS sharpness 0..1 (0 = no sharpening; 1 = strongest). It crisps lid lines, iris rims, brows and lip edges; it cannot create lashes
+  grain: 0.015,            // fine luma grain, strongest in the mid-tones (4 L (1 - L)), animated per drawn frame; hides the splats' brush-stroke texture. 0 = none
+  upscale: "fsr1"          // splatScale < 1: "fsr1" (EASU edge-adaptive) | "bilinear" (as before)
 };
 export const CATCHLIGHT_DEFAULTS = {
   radius: 0.008,           // m: the glint sits on a sphere this big (the cornea's curvature, 7.8 mm; 0.012 = the eyeball: glints run off the iris at +-35) at centre + radius * normalize(to camera + to light)
@@ -160,11 +169,16 @@ export const RENDER_PROFILES = {                                // starting poin
 const NO_XO = { shc: null, deg: 2, radial: false };
 function readRender(base, add) {                                 // merge, then expand the shorthands (true / "portrait")
   const a = add ? { ...add } : {};
-  if (a.catchlights === true) a.catchlights = {}; if (a.post === "portrait") a.post = PORTRAIT_POST; if (a.post === true) a.post = PORTRAIT_POST;
+  if (a.catchlights === true) a.catchlights = {}; if (a.detail === true) a.detail = {}; if (a.detail === false) a.detail = null; if (a.post === "portrait") a.post = PORTRAIT_POST; if (a.post === true) a.post = PORTRAIT_POST;
   const r = mergeDeep(base, a);
   if (r.catchlights) r.catchlights = mergeDeep(CATCHLIGHT_DEFAULTS, r.catchlights);
   if (r.post) r.post = mergeDeep({ vignette: 0, grain: 0, plate: null, shadow: null }, r.post);
+  r.detail = readDetail(r.detail);
   return r;
+}
+export function readDetail(d) {                                   // render.detail -> null (off) or the full options (pure, tested): true / {} = DETAIL_DEFAULTS
+  if (d === true) d = {}; if (!d || typeof d !== "object") return null; const r = mergeDeep(DETAIL_DEFAULTS, d);
+  r.sharpen = Math.min(1, Math.max(0, +r.sharpen || 0)); r.grain = Math.max(0, +r.grain || 0); if (r.upscale !== "bilinear") r.upscale = "fsr1"; return r;
 }
 // The pupils (catchlights): per blinkSweep eye, the opacity-weighted centre of the dark (base colour luminance < 0.18), opaque Gaussians within 8 mm that move
 // with gazeX; null for an eye with too few. A few ms over the model once at load (front models with a blink sweep only).
@@ -374,6 +388,45 @@ void main() { vec2 q = (vUv - uCtr) * uAsp; float g = exp(-dot(q, q) / (uFall * 
   vec3 c = lum < 0.5 ? uBg + uLift * g * uTint : uBg * (1.0 - uLift * 0.6 * (1.0 - g));   // dark: a soft lit area behind the head; light: the edges fall off instead
   if (uShA > 0.0) { vec2 s = (vUv - uSh.xy) / uShS; float k = exp(-dot(s, s) * 2.0); c *= 1.0 - uShA * k; }
   o = vec4(c, 1.0); }`;
+// Detail pass (DETAIL_DEFAULTS): CAS from ffx_cas.h (FidelityFX, MIT, Copyright (c) 2020 Advanced Micro Devices, Inc.): 3x3 min/max -> adaptive negative-lobe
+// weight. Taps are bilinear at output-pixel offsets, so the same pass resolves a larger (supersampled) or equal texture to the canvas. + mid-tone luma grain.
+const FS_CAS = GLSL_HEAD + `out vec4 o; uniform sampler2D uSrc; uniform vec2 uOut; uniform float uSharp, uGrain, uSeed;
+vec3 T(vec2 d) { return texture(uSrc, (gl_FragCoord.xy + d) / uOut).rgb; }
+float hash(vec2 p) { p = fract(p * vec2(443.897, 441.423) + uSeed); p += dot(p, p.yx + 19.19); return fract((p.x + p.y) * p.x); }
+void main() { vec3 a = T(vec2(-1, 1)), b = T(vec2(0, 1)), c = T(vec2(1, 1)), d = T(vec2(-1, 0)), e = T(vec2(0)), f = T(vec2(1, 0)), g = T(vec2(-1, -1)), h = T(vec2(0, -1)), i = T(vec2(1, -1));
+  vec3 col = e;
+  if (uSharp > 0.0) { vec3 mn = min(min(min(d, e), min(f, b)), h); mn += min(mn, min(min(a, c), min(g, i)));
+    vec3 mx = max(max(max(d, e), max(f, b)), h); mx += max(mx, max(max(a, c), max(g, i)));
+    vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0)); vec3 w = -amp / (8.0 - 3.0 * uSharp);
+    col = clamp((e + w * (b + d + f + h)) / (1.0 + 4.0 * w), 0.0, 1.0); }
+  if (uGrain > 0.0) { float L = dot(col, vec3(0.299, 0.587, 0.114)); col = clamp(col + (hash(gl_FragCoord.xy) + hash(gl_FragCoord.xy + 17.3) - 1.0) * uGrain * 4.0 * L * (1.0 - L), 0.0, 1.0); }
+  o = vec4(col, 1.0); }`;
+// FSR1 EASU (ffx_fsr1.h FsrEasuF, FidelityFX, MIT, Copyright (c) 2021 Advanced Micro Devices, Inc.), GLSL ES port: 12-tap edge-adaptive Lanczos-2 approximation,
+// clamped to the 2x2 neighbourhood. Input uSrc (texel size uIn), output canvas uOut.
+const FS_EASU = GLSL_HEAD + `out vec4 o; uniform sampler2D uSrc; uniform vec2 uIn, uOut;
+vec3 F(vec2 p) { return texelFetch(uSrc, ivec2(clamp(p, vec2(0), uIn - 1.0)), 0).rgb; }
+float Lm(vec3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }
+void setF(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE) {
+  float dc = lD - lC, cb = lC - lB, lenX = max(abs(dc), abs(cb)); lenX = lenX > 0.0 ? 1.0 / lenX : 0.0; float dirX = lD - lB; dir.x += dirX * w; lenX = clamp(abs(dirX) * lenX, 0.0, 1.0); len += lenX * lenX * w;
+  float ec = lE - lC, ca = lC - lA, lenY = max(abs(ec), abs(ca)); lenY = lenY > 0.0 ? 1.0 / lenY : 0.0; float dirY = lE - lA; dir.y += dirY * w; lenY = clamp(abs(dirY) * lenY, 0.0, 1.0); len += lenY * lenY * w; }
+void tap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len2, float lob, float clp, vec3 c) {
+  vec2 v = vec2(off.x * dir.x + off.y * dir.y, off.x * -dir.y + off.y * dir.x) * len2; float d2 = min(dot(v, v), clp);
+  float wB = 0.4 * d2 - 1.0, wA = lob * d2 - 1.0; wB *= wB; wA *= wA; wB = 1.5625 * wB - 0.5625; float w = wB * wA; aC += c * w; aW += w; }
+void main() { vec2 pp = gl_FragCoord.xy * (uIn / uOut) - 0.5, fp = floor(pp); pp -= fp;   // y up in both (texel row 0 = bottom), so 'up' (b, c) is -1 in y as in FSR's y-down only by naming
+  vec3 b = F(fp + vec2(0, -1)), c = F(fp + vec2(1, -1)), e = F(fp + vec2(-1, 0)), f = F(fp), g = F(fp + vec2(1, 0)), h = F(fp + vec2(2, 0));
+  vec3 i = F(fp + vec2(-1, 1)), j = F(fp + vec2(0, 1)), k = F(fp + vec2(1, 1)), l = F(fp + vec2(2, 1)), n = F(fp + vec2(0, 2)), q = F(fp + vec2(1, 2));
+  float bL = Lm(b), cL = Lm(c), eL = Lm(e), fL = Lm(f), gL = Lm(g), hL = Lm(h), iL = Lm(i), jL = Lm(j), kL = Lm(k), lL = Lm(l), nL = Lm(n), oL = Lm(q);
+  vec2 dir = vec2(0); float len = 0.0;
+  setF(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL); setF(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);
+  setF(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL); setF(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);
+  float dirR = dot(dir, dir); bool zro = dirR < 1.0 / 32768.0; dirR = zro ? 1.0 : inversesqrt(dirR); dir.x = zro ? 1.0 : dir.x; dir *= dirR;
+  len = len * 0.5; len *= len; float stretch = dot(dir, dir) / max(abs(dir.x), abs(dir.y)); vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+  float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len, clp = 1.0 / lob; vec3 aC = vec3(0); float aW = 0.0;
+  tap(aC, aW, vec2(0, -1) - pp, dir, len2, lob, clp, b); tap(aC, aW, vec2(1, -1) - pp, dir, len2, lob, clp, c); tap(aC, aW, vec2(-1, 1) - pp, dir, len2, lob, clp, i);
+  tap(aC, aW, vec2(0, 1) - pp, dir, len2, lob, clp, j); tap(aC, aW, vec2(0, 0) - pp, dir, len2, lob, clp, f); tap(aC, aW, vec2(-1, 0) - pp, dir, len2, lob, clp, e);
+  tap(aC, aW, vec2(1, 1) - pp, dir, len2, lob, clp, k); tap(aC, aW, vec2(2, 1) - pp, dir, len2, lob, clp, l); tap(aC, aW, vec2(2, 0) - pp, dir, len2, lob, clp, h);
+  tap(aC, aW, vec2(1, 0) - pp, dir, len2, lob, clp, g); tap(aC, aW, vec2(1, 2) - pp, dir, len2, lob, clp, q); tap(aC, aW, vec2(0, 2) - pp, dir, len2, lob, clp, n);
+  vec3 mn = min(min(f, g), min(j, k)), mx = max(max(f, g), max(j, k)); o = vec4(min(mx, max(mn, aC / aW)), 1.0); }`;
 const FS_POST = GLSL_HEAD + `in vec2 vUv; out vec4 o; uniform float uVig, uGrain, uSeed; uniform vec2 uAsp;
 float hash(vec2 p) { p = fract(p * vec2(443.897, 441.423) + uSeed); p += dot(p, p.yx + 19.19); return fract((p.x + p.y) * p.x); }
 void main() { vec2 q = (vUv - 0.5) * uAsp; float v = 1.0 - uVig * smoothstep(0.25, 0.95, dot(q, q) * 1.6);
@@ -1448,7 +1501,7 @@ async function create(canvas, options = {}) {
   const controlNames = Array.isArray(rig.controls) ? rig.controls.slice() : [], named = hasRig && controlNames.length > 0;
   const Km = D.Km, Ks = rig.Ks || 0, Kh = rig.Kh || 0;
   const BS = named ? readBlinkSweep(D.hdr, controlNames, Km) : null;   // blink sweep (header blinkSweep), null for every older model
-  let RS = readRender(RENDER_DEFAULTS, options.render);          // render options (RENDER_DEFAULTS; all off by default)
+  let RS = readRender(RENDER_DEFAULTS, options.render);          // render options (RENDER_DEFAULTS; all off by default except detail)
   const QEXT = clamp(+RS.quadExtent || 4, 1, 4), FSX = fsFor(QEXT), hdrAA = !!(D.hdr.antialiased || (D.hdr.render && D.hdr.render.antialiased));
   const aaOn = () => (RS.aaCompensation === "auto" ? hdrAA : !!RS.aaCompensation), shDeg = () => clamp(Math.round(+RS.shDegree), 0, 2);
   const restOf = j => (rig.rest && Number.isFinite(rig.rest[j]) ? rig.rest[j] : 0);   // a control appended by the finish (browUp, breath, ...) may have no rest entry: 0
@@ -1702,10 +1755,20 @@ async function create(canvas, options = {}) {
     const yc = clamp(eff.yaw, -A, A), Q = headQAt(yc, eff.pitch, yc), zf = zfixOf(Q, V), hP = head.piv, v = mv3(Q, [pos[0] - hP[0] - zf[0], pos[1] - hP[1] - zf[1], pos[2] - hP[2] - zf[2]]);
     return [hP[0] + v[0], hP[1] + v[1], hP[2] + v[2]];
   }
-  const XT = { prog: null, fbo: null, tex: null, w: 0, h: 0, eyes: null, bust: null, seed: 0, last: false };
+  const XT = { prog: null, fbo: null, tex: null, w: 0, h: 0, eyes: null, bust: null, seed: 0, last: false, ss: 1, up: null };   // ss: supersample kept in the texture (detail pass); up: EASU target
   const xLink = (vs, fs) => { const p = link(vs, fs), u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); for (let i = 0; i < n; i++) { const a = gl.getActiveUniform(p, i); u[a.name] = gl.getUniformLocation(p, a.name); } return { p, u }; };
-  function xProgs() { if (!XT.prog) XT.prog = { plate: xLink(VS_FULL, FS_PLATE), post: xLink(VS_FULL, FS_POST), glint: xLink(VS_GLINT, FS_GLINT), vao: gl.createVertexArray() }; return XT.prog; }
+  function xProgs() { if (!XT.prog) XT.prog = { plate: xLink(VS_FULL, FS_PLATE), post: xLink(VS_FULL, FS_POST), glint: xLink(VS_GLINT, FS_GLINT), cas: xLink(VS_FULL, FS_CAS), easu: xLink(VS_FULL, FS_EASU), vao: gl.createVertexArray() }; return XT.prog; }
+  function texTarget(o, w, h, filt) {                            // (re)make an RGBA8 texture + framebuffer pair of this size in o ({ tex, fbo, w, h })
+    if (o.tex && o.w === w && o.h === h) return o; if (o.tex) gl.deleteTexture(o.tex); if (o.fbo) gl.deleteFramebuffer(o.fbo);
+    o.tex = gl.createTexture(); gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, o.tex); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    o.fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, o.fbo); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, o.tex, 0); gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    o.w = w; o.h = h; return o;
+  }
   function target() {                                            // where the splats go this frame: the canvas, or (render.splatScale < 1) a smaller texture scaled up after
+    if (RS.detail) { const s0 = +RS.splatScale, s = (s0 > 0 && s0 < 1 ? s0 : 1) * XT.ss, w = Math.max(1, Math.round(canvas.width * s)), h = Math.max(1, Math.round(canvas.height * s));   // detail pass: always a texture
+      const D_ = XT.dt || (XT.dt = {}); texTarget(D_, w, h, gl.LINEAR); return { w, h, fbo: D_.fbo, tex: D_.tex, detail: true }; }
     const s = +RS.splatScale; if (!(s > 0 && s < 1)) return { w: canvas.width, h: canvas.height, fbo: null };
     const w = Math.max(1, Math.round(canvas.width * s)), h = Math.max(1, Math.round(canvas.height * s));
     if (XT.w !== w || XT.h !== h || !XT.fbo) {
@@ -1772,8 +1835,20 @@ async function create(canvas, options = {}) {
     else gl.uniform1f(u.uShA, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3); gl.enable(gl.BLEND);
   }
+  function detailResolve(T) {                                    // the detail pass: [EASU up to the canvas size], then CAS + grain onto the canvas
+    const X = xProgs(), dt = RS.detail; let src = T.tex, sw = T.w, sh = T.h; gl.disable(gl.BLEND); gl.bindVertexArray(X.vao);
+    if (sw < canvas.width && dt.upscale === "fsr1") {
+      const U_ = XT.up || (XT.up = {}); texTarget(U_, canvas.width, canvas.height, gl.LINEAR); gl.bindFramebuffer(gl.FRAMEBUFFER, U_.fbo); gl.viewport(0, 0, U_.w, U_.h);
+      gl.useProgram(X.easu.p); gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, src); gl.uniform1i(X.easu.u.uSrc, 7); gl.uniform2f(X.easu.u.uIn, sw, sh); gl.uniform2f(X.easu.u.uOut, U_.w, U_.h);
+      gl.drawArrays(gl.TRIANGLES, 0, 3); src = U_.tex; sw = U_.w; sh = U_.h; }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height);
+    const u = X.cas.u; gl.useProgram(X.cas.p); gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, src); gl.uniform1i(u.uSrc, 7); gl.uniform2f(u.uOut, canvas.width, canvas.height);
+    gl.uniform1f(u.uSharp, clamp(+dt.sharpen || 0, 0, 1)); gl.uniform1f(u.uGrain, Math.max(0, +dt.grain || 0)); gl.uniform1f(u.uSeed, (XT.seed = (XT.seed + 0.6180339887) % 1));
+    gl.drawArrays(gl.TRIANGLES, 0, 3); gl.enable(gl.BLEND);
+  }
   function endFrame(T, V, pos) {                                 // scale the splat target up, then catchlights and post on the canvas
-    if (T.fbo) { gl.bindFramebuffer(gl.READ_FRAMEBUFFER, T.fbo); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null); gl.blitFramebuffer(0, 0, T.w, T.h, 0, 0, canvas.width, canvas.height, gl.COLOR_BUFFER_BIT, gl.LINEAR); gl.bindFramebuffer(gl.FRAMEBUFFER, null); }
+    if (T.detail) detailResolve(T);
+    else if (T.fbo) { gl.bindFramebuffer(gl.READ_FRAMEBUFFER, T.fbo); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null); gl.blitFramebuffer(0, 0, T.w, T.h, 0, 0, canvas.width, canvas.height, gl.COLOR_BUFFER_BIT, gl.LINEAR); gl.bindFramebuffer(gl.FRAMEBUFFER, null); }
     gl.viewport(0, 0, canvas.width, canvas.height);
     const G = RS.catchlights ? glints(V, pos) : [], po = RS.post, pv = po && (po.vignette > 0 || po.grain > 0);
     if (!G.length && !pv) return;
@@ -1820,7 +1895,7 @@ async function create(canvas, options = {}) {
     gl.bindVertexArray(r.vao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, m);
     if (xOn()) endFrame(T, f.V, f.pos);
   }
-  function xOn() { const s = +RS.splatScale; return !!(RS.catchlights || RS.post || (s > 0 && s < 1)); }   // any render extra this frame (else: the old clear + draw)
+  function xOn() { const s = +RS.splatScale; return !!(RS.catchlights || RS.post || RS.detail || (s > 0 && s < 1)); }   // any render extra this frame (else: the old clear + draw)
   function gpuPost(f) { const r = R, buf = r.wbuf; r.wbuf = null; r.inflight = f; r.wk.w.postMessage({ gen: r.gen, F: f.F, buf }, [buf.buffer]); }
   function workerDone(d) {                                       // the order for the frame in flight: upload, draw, report the frame; then the newest waiting frame goes
     const r = R, f = r.inflight; r.inflight = null;
@@ -2152,7 +2227,8 @@ async function create(canvas, options = {}) {
   let lastSig = null, lastBg = null;                            // what the last frame depended on: a loop frame with the same inputs is not drawn again (the canvas keeps its picture)
   const fixed = options.size || null, pixelRatio = options.pixelRatio;
   function resize() {
-    const d0 = pixelRatio || Math.min(globalThis.devicePixelRatio || 1, 2), ssf = +RS.supersample, dpr = ssf > 1 && !pixelRatio ? Math.min(d0 * ssf, Math.max(d0, +RS.maxDpr || 3)) : d0, w = fixed ? fixed.width : Math.round(canvas.clientWidth * dpr), h = fixed ? fixed.height : Math.round(canvas.clientHeight * dpr);
+    const d0 = pixelRatio || Math.min(globalThis.devicePixelRatio || 1, 2), ssf = +RS.supersample, dss = ssf > 1 && !pixelRatio ? Math.min(d0 * ssf, Math.max(d0, +RS.maxDpr || 3)) : d0;
+    XT.ss = RS.detail ? dss / d0 : 1; const dpr = RS.detail ? d0 : dss, w = fixed ? fixed.width : Math.round(canvas.clientWidth * dpr), h = fixed ? fixed.height : Math.round(canvas.clientHeight * dpr);
     if (w < 1 || h < 1) return false;
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); dirty = true; lastSig = null; } return true;
   }
@@ -2352,6 +2428,6 @@ async function create(canvas, options = {}) {
 function registerDriver(name, factory) { driverRegistry[name] = factory; }
 // a driver on its own, for tests and for pages that want the weights without a viewer: makeDriver(name, { controls, Ks, index(name), settings() })
 function makeDriver(name, env) { const f = driverRegistry[name]; if (!f) throw new Error("unknown driver " + name); return f(env); }
-export const OpenAvatarViewer = { create, RENDER_DEFAULTS, RENDER_PROFILES, CATCHLIGHT_DEFAULTS, PORTRAIT_POST, catchlightPoint, GAZE_CAL, FREE_HEAD, ROLL_DEFAULT_DEG, nodCurve, wordsFromTimings, analysePcm, softLimit, registerDriver, makeDriver, makeRelease, makeBlinker, blinkSweepWeight, blinkSweepHeight, readBlinkSweep, SPEECH_RELEASE_S, SPEECH_RELEASE_MOUTH_S, followCurve, FORMAT_MAJOR, DEFAULT_PRESET, VISEME_WEIGHTS, lettersToVisemes, timingsToPhones, wordToPhones, phonesToTrack,
+export const OpenAvatarViewer = { create, RENDER_DEFAULTS, RENDER_PROFILES, DETAIL_DEFAULTS, readDetail, CATCHLIGHT_DEFAULTS, PORTRAIT_POST, catchlightPoint, GAZE_CAL, FREE_HEAD, ROLL_DEFAULT_DEG, nodCurve, wordsFromTimings, analysePcm, softLimit, registerDriver, makeDriver, makeRelease, makeBlinker, blinkSweepWeight, blinkSweepHeight, readBlinkSweep, SPEECH_RELEASE_S, SPEECH_RELEASE_MOUTH_S, followCurve, FORMAT_MAJOR, DEFAULT_PRESET, VISEME_WEIGHTS, lettersToVisemes, timingsToPhones, wordToPhones, phonesToTrack,
   setLexicon, loadLexicon, lexiconInfo };
 export default OpenAvatarViewer;
